@@ -3477,9 +3477,6 @@ importers:
       '@deepseek-ai/schemastery':
         specifier: link:../../../vendor/schemastery
         version: link:../../../vendor/schemastery
-      opencc-js:
-        specifier: ^1.4.2
-        version: 1.4.2
     devDependencies:
       '@deepseek-ai/cordis':
         specifier: workspace:~
@@ -3514,6 +3511,9 @@ importers:
       '@deepseek-ai/dsh-settings':
         specifier: workspace:*
         version: link:../../settings/settings
+      opencc-js:
+        specifier: ^1.4.2
+        version: 1.4.2
       react:
         specifier: ^18.2.0
         version: 18.3.1
