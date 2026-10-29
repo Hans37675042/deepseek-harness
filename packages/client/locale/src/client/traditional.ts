@@ -28,7 +28,7 @@ function byMeansOf(match: string, offset: number, whole: string): string {
 }
 
 /** Not a package: 包括 包含 包裹 包裝 包容 包圍 包辦 包庇 包子 包廂 包場, and 錢包 書包 背包 紅包 行包 郵包 皮包 麵包 打包 提包 組合包. */
-const PACKAGE = /(?<!錢|書|背|紅|行|郵|皮|麵|打|提|組合|紙|揹)包(?![括含裹裝容圍辦庇子廂場])/gu
+const PACKAGE = /(?<!錢|書|背|紅|行|郵|皮|麵|打|提|組合|紙|揹)包(?![括含裹裝容圍辦庇子廂場頭])/gu
 
 /**
  * Taiwan UI terms applied to the converted text, in order, with the reason a
@@ -70,14 +70,16 @@ export const TAIWAN_TERM_OVERRIDES: readonly (readonly [from: string | RegExp, t
   ['創建', '建立'],
   ['窗口', '視窗'],
   ['復制', '複製'],
-  ['響應', '回應'],
+  [/響應(?!式)/gu, '回應'],
   // 終端 alone is a terminal emulator; 終端使用者 and 終端設備 are end users and devices.
   [/終端(?![機使設裝節])/gu, '終端機'],
   ['彈窗', '彈出視窗'],
   ['標籤頁', '分頁'],
   ['迴復', '回覆'],
   // twp writes 併 for the conjunction 并 before verbs; 一併 and 併入 stay.
-  [/併(?=為|發送|將)/gu, '並'],
+  [/(?<![合兼吞歸一])併(?=為|發送|將)/gu, '並'],
+  // OpenCC writes 合並 for 合并 in a few phrases (壓縮合並).
+  ['合並', '合併'],
   [/隻(?=[會根影是有能需要在對為用讀可])/gu, '只'],
   ['倉庫', '儲存庫'],
   ['程序', '行程'],
@@ -87,8 +89,14 @@ export const TAIWAN_TERM_OVERRIDES: readonly (readonly [from: string | RegExp, t
   ['郵箱', '電子郵件'],
   [/(?<!電子郵件)地址/gu, '位址'],
   ['文本', '文字'],
+  [/只讀(?!取)/gu, '唯讀'],
+  ['平臺', '平台'],
+  ['全域性', '全域'],
+  ['聲明瞭', '聲明了'],
+  [/贊(?=踩|、)/gu, '讚'],
   // 包 as a software package: 外掛包, 包名, npm 包; archives are 壓縮檔.
   ['壓縮包', '壓縮檔'],
+  [/(?<!已)安裝包/gu, '安裝檔'],
   ['包名', '套件名稱'],
   [PACKAGE, '套件'],
   // Quotation marks: 「」 and 『』 instead of curly quotes; apostrophes stay.
@@ -97,7 +105,7 @@ export const TAIWAN_TERM_OVERRIDES: readonly (readonly [from: string | RegExp, t
 ]
 
 /** Spans that must reach the output verbatim: placeholders, code, URLs, commands, API identifiers. */
-const PROTECTED = /\{\w+\}|`[^`]*`|https?:\/\/[^\s、-〿＀-￯)]+|(?<![A-Za-z0-9/])\/[A-Za-z][\w-]*|\b[a-z]+_[a-z_]+\b/gu
+const PROTECTED = /\{\w+\}|`[^`]*`|https?:\/\/[^\s、-〿＀-￯\p{Script=Han})]+|(?<![A-Za-z0-9/])\/[A-Za-z][\w-]*|\b[a-z]+_[a-z_]+\b/gu
 
 /**
  * Spans of a Markdown document that stay as written: fenced code, inline code,
@@ -105,8 +113,8 @@ const PROTECTED = /\{\w+\}|`[^`]*`|https?:\/\/[^\s、-〿＀-￯)]+|(?<![A-Za-z0
  * then everything {@link PROTECTED} keeps.
  */
 const MARKDOWN_PROTECTED = new RegExp([
-  '(?:^|(?<=\\n))[ \\t]*(`{3,}|~{3,})[^\\n]*\\n[\\s\\S]*?(?:\\n[ \\t]*\\1[`~]*[ \\t]*(?=\\n|(?![\\s\\S]))|(?![\\s\\S]))',
-  '`+[^`\\n]+`+',
+  '(?:^|(?<=\\n))[ \\t]*(`{3,}|~{3,})[^\\n]*\\n[\\s\\S]*?(?:(?<=\\n)[ \\t]*\\1[`~]*[ \\t]*(?=\\n|(?![\\s\\S]))|(?![\\s\\S]))',
+  '(?<!`)(`+)(?!`)[^\\n]*?(?<!`)\\2(?!`)',
   '(?<=\\]\\()[^)\\s]+',
   '(?<=^\\s*\\[[^\\]\\n]+\\]:[ \\t]*)\\S+',
   '<\\/?[A-Za-z][^>\\n]*>',
