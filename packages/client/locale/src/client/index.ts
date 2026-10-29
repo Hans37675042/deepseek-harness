@@ -28,6 +28,7 @@ import {
 import type { LanguageRowInjected } from './LanguageRow.tsx'
 import { LanguageRow } from './LanguageRow.tsx'
 import { createLanguageRowStore } from './settings-store.ts'
+import { loadTraditionalConverter, toTraditional, toTraditionalMarkdown, type TraditionalConverter } from './traditional.ts'
 
 export type { LanguageRowComponentProps, LanguageRowInjected } from './LanguageRow.tsx'
 export type { LanguageOptionRow, LanguageRowState } from './settings-store.ts'
@@ -112,6 +113,14 @@ export const FALLBACK_LOCALE: BuiltInLocaleId = 'en'
 /** Shared namespace for shell-level texts. */
 export const COMMON_NS = 'common'
 
+/**
+ * How long a browser-derived zh-TW waits for the stored Host preference before it loads the converter;
+ * the Host read is a local RPC that answers in milliseconds.
+ */
+export const HOST_WAIT_MS = 1000
+/** How long boot waits for the locale to settle; after that the UI starts in the interim language and switches later. */
+export const BOOT_WAIT_MS = 2000
+
 /** Namespace owning this feature's settings-row copy. */
 export const SETTINGS_NS = 'settings.locale'
 
@@ -123,6 +132,9 @@ const BUILT_IN_LOCALE_METADATA = {
 const BUILT_IN_LOCALES: readonly LocaleDefinition[] = Object.freeze(
   LOCALE_IDS.map(id => Object.freeze({ id, ...BUILT_IN_LOCALE_METADATA[id] })),
 )
+
+/** Locale whose text is the Simplified `zh` text converted at read time. */
+export const TRADITIONAL_LOCALE = 'zh-TW'
 
 /** Case-insensitive key for BCP 47-style ids. */
 function localeKey(value: string): string {
@@ -176,6 +188,21 @@ export class LocaleRuntime {
   private provisional: LocaleId
   /** Last explicit selection, including one awaiting an external registration. */
   private preference: LocaleId | undefined
+  /** Simplified to Traditional converter, loaded on first need by zh-TW. */
+  private converter: TraditionalConverter | undefined
+  private converterLoading: Promise<void> | undefined
+  /** Whether a failed converter load already waits for the browser to come back online. */
+  private retryOnOnline = false
+  /** Whether the Host's first preference read settled, failed, or ran out of time. */
+  private hostReleased = false
+  /** Pending while a browser-derived zh-TW waits for the Host preference; see {@link converterReady}. */
+  private hostWait: Promise<void> | undefined
+  private releaseHostWait: (() => void) | undefined
+  private hostTimer = false
+  /** Whether the owning plugin fiber ended; late converter work then stops. */
+  private get disposed(): boolean {
+    return this.ctx.fiber.uid === null
+  }
 
   /**
    * @param ctx - owning context (change events are emitted on it; the scope
@@ -191,7 +218,7 @@ export class LocaleRuntime {
     const locales = this.localeList()
     this.provisional = resolveInitialLocale(locales, bootstrap?.languages)
     this.preference = bootstrap?.preference ?? undefined
-    this.snapshot = Object.freeze({ active: this.resolveActive(), locales, revision: 0 })
+    this.snapshot = Object.freeze({ active: this.settle(this.resolveActive()), locales, revision: 0 })
     if (host !== undefined) {
       ctx.effect(() => host.subscribe(() => { this.adopt(host) }), 'locale: settings scope adoption')
       this.adopt(host)
@@ -214,10 +241,138 @@ export class LocaleRuntime {
    */
   resolveText(text: LocalizedText): string {
     if (typeof text === 'string') return text
-    return this.fallbackChain(this.snapshot.active).reduceRight(
-      (resolved, locale) => text[localeKey(locale)] ?? resolved,
-      text.en,
+    const chain = this.fallbackChain(this.snapshot.active)
+    for (const locale of chain) {
+      const value = text[localeKey(locale)]
+      if (value !== undefined) return this.localize(locale, value, chain)
+    }
+    return text.en
+  }
+
+  /** Whether the Traditional converter has finished loading. */
+  get converterLoaded(): boolean {
+    return this.converter !== undefined
+  }
+
+  /**
+   * Resolve once a pending zh-TW wish is settled: after the Host answered (a
+   * browser-derived zh-TW does not load the converter before that), the
+   * converter loaded, and the switch happened. Resolves at once when nothing
+   * waits.
+   * @returns a promise that never rejects.
+   */
+  converterReady(): Promise<void> {
+    if (this.hostWait !== undefined) return this.hostWait.then(() => this.converterLoading)
+    return this.converterLoading ?? Promise.resolve()
+  }
+
+  /**
+   * Convert a Markdown document read for `language` (plugin detail pages): the
+   * Simplified text the Host serves for zh-TW becomes Taiwan Traditional.
+   * Other languages and a converter that has not loaded return it unchanged.
+   * @param language - language the document was read for.
+   * @param markdown - the document.
+   * @returns the document to show.
+   */
+  convertDocument(language: LocaleId, markdown: string): string {
+    if (this.converter === undefined || !this.chainReachesTraditional(this.fallbackChain(language))) return markdown
+    return toTraditionalMarkdown(markdown, this.converter)
+  }
+
+  /**
+   * The locale to show for a wanted one. A zh-TW wish waits for its converter:
+   * the locale already showing stays (zh when nothing shows yet), so no screen
+   * flashes Simplified text and consumers that only listen to `locale/change`
+   * still see one switch to a ready locale.
+   */
+  private settle(wanted: LocaleId, showing?: LocaleId): LocaleId {
+    const chain = this.fallbackChain(wanted)
+    if (this.converter !== undefined || !this.chainReachesTraditional(chain)) return wanted
+    if (this.waitsForHost(wanted)) this.startHostWait()
+    else this.ensureConverter()
+    if (showing !== undefined && !this.chainReachesTraditional(this.fallbackChain(showing))) return showing
+    return chain.find(id => !this.chainReachesTraditional(this.fallbackChain(id))) ?? FALLBACK_LOCALE
+  }
+
+  /**
+   * Whether a wished locale comes from the browser while the Host's stored
+   * preference is unknown: a user whose stored choice is another language never
+   * downloads the converter, so only an explicit choice loads it at once.
+   */
+  private waitsForHost(wanted: LocaleId): boolean {
+    if (this.host === undefined || this.hostReleased) return false
+    if (this.preference !== undefined && localeKey(this.preference) === localeKey(wanted)) return false
+    return this.host.getSnapshot().status === 'loading'
+  }
+
+  private startHostWait(): void {
+    this.hostWait ??= new Promise<void>((resolve) => { this.releaseHostWait = resolve })
+    if (this.hostTimer) return
+    this.hostTimer = true
+    this.ctx.effect(() => {
+      const timer = setTimeout(() => { this.releaseHost() }, HOST_WAIT_MS)
+      return () => { clearTimeout(timer) }
+    }, 'locale: stop waiting for the Host preference')
+  }
+
+  /** The Host answered, failed, or timed out: a browser-derived zh-TW may now load the converter. */
+  private releaseHost(): void {
+    if (this.hostReleased || this.disposed) return
+    this.hostReleased = true
+    this.reconcile()
+    this.releaseHostWait?.()
+    this.hostWait = undefined
+    this.releaseHostWait = undefined
+  }
+
+  /** Re-evaluate the wanted locale after the converter loaded or the browser came back online. */
+  private reconcile(): void {
+    if (this.disposed) return
+    const next = this.settle(this.resolveActive(), this.snapshot.active)
+    this.publish(next, next !== this.snapshot.active)
+  }
+
+  /** Start loading the converter unless it is loaded or loading; a failed load is retried by the next call. */
+  private ensureConverter(): void {
+    if (this.converter !== undefined || this.converterLoading !== undefined) return
+    this.converterLoading = loadTraditionalConverter().then(
+      (converter) => {
+        if (this.disposed) return
+        this.converter = converter
+        this.converterLoading = undefined
+        this.reconcile()
+      },
+      (error: unknown) => {
+        // The previous locale stays; the next choice of zh-TW or an online event tries again.
+        this.converterLoading = undefined
+        if (this.disposed) return
+        console.error('locale: Traditional converter failed to load:', error)
+        this.retryWhenOnline()
+      },
     )
+  }
+
+  private retryWhenOnline(): void {
+    if (typeof window === 'undefined' || this.retryOnOnline || this.disposed) return
+    this.retryOnOnline = true
+    this.ctx.effect(() => {
+      const retry = (): void => {
+        this.retryOnOnline = false
+        this.reconcile()
+      }
+      window.addEventListener('online', retry, { once: true })
+      return () => { window.removeEventListener('online', retry) }
+    }, 'locale: retry the converter when the browser is online')
+  }
+
+  private chainReachesTraditional(chain: readonly LocaleId[]): boolean {
+    return chain.some(id => localeKey(id) === localeKey(TRADITIONAL_LOCALE))
+  }
+
+  /** Convert text that zh-TW borrowed from the Simplified zh entry. */
+  private localize(locale: LocaleId, value: string, chain: readonly LocaleId[]): string {
+    if (locale !== 'zh' || this.converter === undefined || !this.chainReachesTraditional(chain)) return value
+    return toTraditional(value, this.converter)
   }
 
   /**
@@ -257,7 +412,8 @@ export class LocaleRuntime {
     const match = this.catalog.get(localeKey(id))
     if (match === undefined) throw new Error(`locale "${id}" is not registered`)
     this.preference = match.id
-    if (this.snapshot.active !== match.id) this.publish(match.id, true)
+    const next = this.settle(match.id, this.snapshot.active)
+    if (this.snapshot.active !== next) this.publish(next, true)
     void this.host?.set(LOCALE_PREFERENCE_FIELD, match.id)
   }
 
@@ -303,10 +459,19 @@ export class LocaleRuntime {
    * @param host - the constructor-narrowed scope driving this adoption.
    */
   private adopt(host: ConfigForm<LocaleSettings>): void {
-    const section = host.getSnapshot().value
-    if (section === undefined) return
+    const snapshot = host.getSnapshot()
+    const section = snapshot.value
+    if (section === undefined) {
+      // A failed read (no value, not loading) ends the wait for a stored preference.
+      if (snapshot.status !== 'loading') this.releaseHost()
+      return
+    }
+    this.hostReleased = true
     this.preference = section.preference
-    const target = this.resolveActive()
+    const target = this.settle(this.resolveActive(), this.snapshot.active)
+    this.releaseHostWait?.()
+    this.hostWait = undefined
+    this.releaseHostWait = undefined
     if (this.snapshot.active === target) return
     this.publish(target, true)
   }
@@ -316,7 +481,7 @@ export class LocaleRuntime {
     this.fallbackChains.clear()
     const locales = this.localeList()
     this.provisional = resolveInitialLocale(locales, this.bootstrap?.languages)
-    const active = this.resolveActive()
+    const active = this.settle(this.resolveActive(), this.snapshot.active)
     this.publish(active, active !== this.snapshot.active, locales)
   }
 
@@ -481,7 +646,7 @@ export class LocaleRuntime {
     const locales = this.dicts.get(ns)
     for (const locale of chain) {
       const value = locales?.get(localeKey(locale))?.[key]
-      if (value !== undefined) return value
+      if (value !== undefined) return this.localize(locale, value, chain)
     }
     return undefined
   }
@@ -525,6 +690,19 @@ function resolveInitialLocale(locales: readonly LocaleDefinition[], languages?: 
 }
 
 /**
+ * Script of a Chinese browser tag: Traditional for zh-Hant and the Traditional
+ * regions (TW, HK, MO), Simplified for every other Chinese tag.
+ * @param tag - lowercase BCP 47-style tag.
+ * @returns the locale id serving it, or undefined for non-Chinese tags.
+ */
+function chineseVariant(tag: string): LocaleId | undefined {
+  const parts = tag.split('-')
+  if (parts[0] !== 'zh') return undefined
+  const traditional = parts.slice(1).some(part => part === 'hant' || part === 'tw' || part === 'hk' || part === 'mo')
+  return traditional && !parts.includes('hans') ? TRADITIONAL_LOCALE : 'zh'
+}
+
+/**
  * The first registered locale the browser asks for. Each browser tag first
  * matches a locale id exactly, then its primary subtag, so an exact regional
  * registration wins before a language-wide fallback.
@@ -547,6 +725,11 @@ function detectBrowserLocale(locales: readonly LocaleDefinition[], languages?: r
     const requested = localeKey(tag)
     const exact = locales.find(locale => localeKey(locale.id) === requested)
     if (exact !== undefined) return exact.id
+    const chinese = chineseVariant(requested)
+    if (chinese !== undefined) {
+      const variant = locales.find(locale => localeKey(locale.id) === localeKey(chinese))
+      if (variant !== undefined) return variant.id
+    }
     const primary = requested.split('-')[0]
     const match = locales.find(locale => localeKey(locale.id).split('-')[0] === primary)
     if (match !== undefined) return match.id
@@ -583,8 +766,21 @@ export async function apply(ctx: ClientContext): Promise<void> {
   for (const [id, label] of [['ja', '日本語'], ['es', 'Español'], ['fr', 'Français'], ['de', 'Deutsch'], ['ru', 'Русский'], ['pt', 'Português']] as const) {
     ctx.effect(() => locale.addLanguage({ id, label, fallback: 'en' }), `locale: ${id} language`)
   }
+  // The Electron shell's menus and installer have no zh-TW; only the web UI offers it.
+  if (bridge === undefined) {
+    ctx.effect(() => locale.addLanguage({ id: TRADITIONAL_LOCALE, label: '繁體中文', fallback: 'zh' }), 'locale: zh-TW language')
+  }
   ctx.effect(() => locale.register(COMMON_NS, { zh, en, ja, es, fr, de, ru, pt }), 'locale: common dictionaries')
   ctx.effect(() => locale.register(SETTINGS_NS, { zh: settingsZh, en: settingsEn, ja: settingsJa, es: settingsEs, fr: settingsFr, de: settingsDe, ru: settingsRu, pt: settingsPt }), 'locale: settings dictionaries')
+  // A zh-TW start waits for the Host answer and the converter so the first render is already
+  // Traditional; a slow or stalled chunk only delays boot by BOOT_WAIT_MS, then zh shows until it loads.
+  let bootTimer: ReturnType<typeof setTimeout> | undefined
+  await Promise.race([
+    locale.converterReady(),
+    new Promise<void>((resolve) => { bootTimer = setTimeout(resolve, BOOT_WAIT_MS) }),
+  ])
+  clearTimeout(bootTimer)
+  if (ctx.fiber.uid === null) return
   ctx.provide('locale', locale)
   if (bridge !== undefined) {
     ctx.on('locale/change', (snapshot) => { bridge.onChange(snapshot.active) })

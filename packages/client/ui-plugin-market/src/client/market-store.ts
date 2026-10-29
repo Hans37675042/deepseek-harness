@@ -274,9 +274,13 @@ export class DiscoverController {
     }
     const { url, name, version } = request
     const answer = await remote.pluginMarket.readEntryDetail(url, name, version, language, { refresh, npmFileSources })
-    if (current()) this.publishDetail(key, answer.ok ? { status: 'ready', detail: answer.value } : { status: 'error', failure: detailFailure(answer.error) })
+    if (current()) this.publishDetail(key, answer.ok ? { status: 'ready', detail: this.localized(answer.value, language) } : { status: 'error', failure: detailFailure(answer.error) })
   }
 
+  /** zh-TW reads the Host's Simplified document; the locale service converts it to Taiwan Traditional. */
+  private localized(detail: PluginDetail, language: string): PluginDetail {
+    return detail.status === 'found' ? { ...detail, markdown: this.ctx.locale.convertDocument(language, detail.markdown) } : detail
+  }
   private publishDetail(key: string, state: DetailState): void {
     this.details.set({ ...this.details.getSnapshot(), [key]: state })
   }

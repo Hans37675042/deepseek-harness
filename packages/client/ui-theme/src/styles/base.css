@@ -23,6 +23,14 @@
   --dsw-radius-panel: 28px;
 }
 
+/* Traditional Chinese: Traditional faces lead, so Han characters do not take
+ * Simplified glyph shapes. `<html lang>` is zh-TW while that locale is active. */
+:root:lang(zh-TW) {
+  --dsh-font-family-text-default: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang TC',
+    'Microsoft JhengHei', 'Noto Sans TC', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  --dsh-font-family-code-default: 'SF Mono', 'JetBrains Mono', 'Fira Code', Consolas,
+    'Liberation Mono', Menlo, Courier, 'PingFang TC', 'Microsoft JhengHei';
+}
 /* User font lists (--dsh-font-family-text/-code, written on body by the theme
  * boot script and ThemePresenter) lead the built-in stacks. An unset list
  * falls back to the built-in stack itself; the repeated families are inert. */
