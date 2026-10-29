@@ -16,7 +16,7 @@ import { AssistantStreamAccumulator } from '@deepseek-ai/dsh-llm/assistant-strea
 import { LlmAttemptId } from '@deepseek-ai/dsh-llm/brand'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import { hasAssistantReplyContent } from '../src/client/contract/assistant-content.ts'
-import { latestTtftMs } from '../src/client/chat/StatsPills.tsx'
+import { latestAnswerTokensPerSecond, latestTtftMs } from '../src/client/chat/StatsPills.tsx'
 import { assistantDefinition } from '../src/client/conversation-nodes/assistant.ts'
 import { chatViewDefinition } from '../src/client/conversation-nodes/chat-snapshot-builder.ts'
 import { commandDefinition } from '../src/client/conversation-nodes/command.ts'
@@ -3141,6 +3141,54 @@ describe('assistant first-token display through durable settlement', () => {
       expect(latestTtftMs(snapshot(current).legacy.nodes)).toBe(20)
     }
   })
+
+  it('reads the latest answer speed from the durable stream after live settlement and reopening', () => {
+    const attemptId = LlmAttemptId('answer-speed')
+    const value = assembler(starts())
+    value.append({
+      type: 'transient',
+      event: { type: 'assistant/live-chunk', seq: 2.5, time: 1_030, data: { attemptId, turn: 1, step: 1, chunk: textChunk } },
+    })
+    value.flush()
+    const event = at(3, 'assistant/message', {
+      turn: 1, step: 1, message: assistantMessage('m1', 'Answer'), stream: streamOf(1_030), usage: { outputTokens: 40 },
+    }, { surfaceOp: 'append', time: 1_050 }).event
+    if (event.type !== 'assistant/message') throw new Error('expected Assistant settlement')
+    const entry = { type: 'event' as const, event }
+    value.settleAssistant(attemptId, entry)
+    value.flush()
+    const reopened = assembler([...starts(), entry])
+    for (const current of [value, reopened]) {
+      // 40 tokens over first token (1_030) → completion (1_050): 20 ms, i.e. 2000 tok/s.
+      expect(latestAnswerTokensPerSecond(snapshot(current).legacy.nodes)).toBeCloseTo(2_000, 6)
+    }
+  })
+
+  it.each(['live', 'reopened'] as const)(
+    'measures the latest answer speed over the last attempt only after a retry that follows a first token (%s)',
+    (mode) => {
+      const retry = at(4, 'llm/retry', {
+        retryId: 'r-decode', turn: 1, step: 1, provider: 'fake', mode: 'normal', policyKey: 'fake-normal',
+        retry: 1, maxRetries: 2, delayMs: 10, failure: { code: 'TRANSPORT', message: 'temporary' },
+      }, { time: 1_040 })
+      const message = at(6, 'assistant/message', {
+        turn: 1, step: 1, message: assistantMessage('m1', 'Answer'), stream: streamOf(1_060), usage: { outputTokens: 40 },
+      }, { surfaceOp: 'append', time: 1_100 })
+      const value = assembler(mode === 'live' ? starts() : [...starts(), retry, message])
+      if (mode === 'live') {
+        value.append(at(3, 'assistant/live-chunk', { turn: 1, step: 1, chunk: textChunk }, { time: 1_030 }))
+        value.append(retry)
+        value.append(at(5, 'assistant/live-chunk', { turn: 1, step: 1, chunk: textChunk }, { time: 1_060 }))
+        value.append(message)
+        value.flush()
+      }
+      const final = (node(snapshot(value), 'assistant-step')?.data as AssistantChatData).finalNode
+      // The failed first attempt and the retry wait stay out: 40 tokens over 1_060 → 1_100 is 1000 tok/s.
+      expect(latestAnswerTokensPerSecond(snapshot(value).legacy.nodes)).toBeCloseTo(1_000, 6)
+      expect(final).toMatchObject({ firstTokenLatencyMs: mode === 'live' ? 20 : 50 })
+      if (mode === 'live') expect(final?.timing).toMatchObject({ firstTokenTime: 1_030 })
+    },
+  )
 
   it('stops waiting when a settled attempt already carries a token, and re-arms at its retry', () => {
     const attempt = at(3, 'assistant/attempt', { turn: 1, step: 1, stream: streamOf(1_030) }, { time: 1_040 })
