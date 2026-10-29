@@ -4,7 +4,7 @@
 // token totals, and click-open dialogs. Settled-node identity prevents
 // stream-delta updates from rerendering the pills.
 
-import { memo, useMemo, type ReactNode } from 'react'
+import { Fragment, memo, useMemo, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { IconDatabaseOutlineRegular, IconGaugeOutlineRegular, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { UseProjection } from '@deepseek-ai/dsh-api-session-controller/client'
@@ -13,6 +13,7 @@ import type { InjectFace, SnapshotSelectorHook } from '@deepseek-ai/dsh-client-u
 import type {} from '@deepseek-ai/dsh-session-stats/client'
 import type { TokenUsageProjection } from '@deepseek-ai/dsh-token-meter/client'
 import type { ChatViewSlotProps, PerformanceUsageInjected } from '../contract/slots.ts'
+import type { AssistantMessageNodeWithLatency } from '../contract/chat-nodes.ts'
 import type { ChatSnapshot } from '../contract/snapshot.ts'
 import { formatTokensPerSecond } from './message-chrome.ts'
 import { assistantStepReading } from '../contract/turn-metrics.ts'
@@ -84,6 +85,22 @@ export function deriveStats(nodes: ChatSnapshot['legacy']['nodes']): WindowStats
 }
 
 /**
+ * Find the most recent settled step that recorded a first-token latency.
+ * @param nodes - snapshot nodes in timeline order.
+ * @returns that step's TTFT in milliseconds, or null when no step recorded one.
+ */
+export function latestTtftMs(nodes: ChatSnapshot['legacy']['nodes']): number | null {
+  for (let index = nodes.length - 1; index >= 0; index--) {
+    const node = nodes[index]
+    if (node?.kind !== 'assistant') continue
+    // Live-settled steps lose `timing.firstTokenTime` with their transient chunks; the display latency survives.
+    const ttftMs = assistantStepReading(node).ttftMs ?? (node as AssistantMessageNodeWithLatency).firstTokenLatencyMs ?? null
+    if (ttftMs !== null) return ttftMs
+  }
+  return null
+}
+
+/**
  * Compact duration: 45.2s under a minute, 2m42s from there on.
  * @param ms - duration in milliseconds.
  * @returns display string.
@@ -144,18 +161,28 @@ function exactCount(value: number, t: Translate): string {
   return t('message.turnUsage.count', { count: formatExactTokens(value, t) })
 }
 
-/** One or two reading segments, visually joined by a separator glyph. */
-function reading(first: string, second: string | null): Pick<PillContent, 'label' | 'text'> {
-  if (second === null) return { label: first, text: first }
+/**
+ * Reading segments, visually joined by a separator glyph; null segments drop out.
+ * @param segments - readings in display order.
+ * @param spaceBefore - a segment that follows a literal space as well, because the hidden separator would otherwise
+ * fuse it to the previous reading in the accessibility tree ("tok/sTTFT").
+ */
+function reading(segments: readonly (string | null)[], spaceBefore: string | null = null): Pick<PillContent, 'label' | 'text'> {
+  const [first = '', ...rest] = segments.filter((segment): segment is string => segment !== null)
   return {
     label: (
       <>
         {first}
-        <span className={css.sep} aria-hidden>·</span>
-        {second}
+        {rest.map((segment, index) => (
+          <Fragment key={index}>
+            {segment === spaceBefore && ' '}
+            <span className={css.sep} aria-hidden>·</span>
+            {segment}
+          </Fragment>
+        ))}
       </>
     ),
-    text: `${first} · ${second}`,
+    text: [first, ...rest].join(' · '),
   }
 }
 
@@ -251,15 +278,23 @@ function DialogPill({ stat, icon, label, text, title, titleValue, children }: Pi
 export const ActivityPill = memo(function ActivityPill({ useChat, useProjection, usePerformanceUsage, t }: StatPillProps) {
   const mode = usePerformanceUsage(value => value)
   const stats = useSessionStats(useChat, useProjection)
+  // "Latest" is always inside the loaded window, so the window nodes answer it without a projection.
+  const windowNodes = useChat(s => s.legacy.nodes)
+  const latestTtft = useMemo(() => latestTtftMs(windowNodes), [windowNodes])
   const speed = stats.decodeMs > 0 ? decodeSpeed(stats, t) : null
+  const latest = latestTtft === null ? null : t('stats.latestTtft', { duration: formatDuration(latestTtft, t) })
   const icon = <IconGaugeOutlineRegular />
-  if (mode === 'compact') return speed === null ? null : <PlainPill stat="activity" icon={icon} {...reading(speed, null)} />
+  if (mode === 'compact') {
+    if (speed === null && latest === null) return null
+    return <PlainPill stat="activity" icon={icon} {...reading([speed, latest], latest)} />
+  }
   if (stats.steps === 0) return null
   const counts = t('stats.counts', { turns: stats.turns, steps: stats.steps })
-  const content: PillContent = { stat: 'activity', icon, ...reading(counts, speed) }
+  const content: PillContent = { stat: 'activity', icon, ...reading([counts, speed, latest], latest) }
   // A window without one timed figure has no dialog rows to show, so the pill
   // stays a plain reading instead of a button opening an empty dialog.
-  if (stats.llmMs <= 0 && stats.toolMs <= 0 && stats.ttftSteps <= 0 && speed === null) return <PlainPill {...content} />
+  const untimed = stats.llmMs <= 0 && stats.toolMs <= 0 && stats.ttftSteps <= 0 && speed === null && latestTtft === null
+  if (untimed) return <PlainPill {...content} />
   return (
     // The counts head the dialog, so a cut-off reading stays complete once the dialog opens.
     <DialogPill {...content} title={t('stats.dialog.title')} titleValue={counts}>
@@ -280,6 +315,12 @@ export const ActivityPill = memo(function ActivityPill({ useChat, useProjection,
           <>
             <dt>{t('stats.dialog.ttft')}</dt>
             <dd>{formatDuration(stats.ttftMs / stats.ttftSteps, t)}</dd>
+          </>
+        )}
+        {latestTtft !== null && (
+          <>
+            <dt>{t('stats.dialog.latestTtft')}</dt>
+            <dd>{formatDuration(latestTtft, t)}</dd>
           </>
         )}
         {speed !== null && (
@@ -304,7 +345,7 @@ export const UsagePill = memo(function UsagePill({ useProjection, usePerformance
   const cacheHitText = cacheHit !== null ? t('stats.cacheHit', { percent: cacheHit }) : null
   const icon = <IconDatabaseOutlineRegular />
   if (mode === 'compact') {
-    return cacheHitText === null ? null : <PlainPill stat="usage" icon={icon} {...reading(cacheHitText, null)} />
+    return cacheHitText === null ? null : <PlainPill stat="usage" icon={icon} {...reading([cacheHitText])} />
   }
   // Same aggregate as the Turn pill's totalTokens: every prompt-side billing bucket plus output.
   const total = billedInputTokens(usage) + usage.outputTokens
@@ -313,7 +354,7 @@ export const UsagePill = memo(function UsagePill({ useProjection, usePerformance
     <DialogPill
       stat="usage"
       icon={icon}
-      {...reading(totalText, cacheHitText)}
+      {...reading([totalText, cacheHitText])}
       title={t('stats.dialog.usageTitle')}
       titleValue={exactCount(total, t)}
     >

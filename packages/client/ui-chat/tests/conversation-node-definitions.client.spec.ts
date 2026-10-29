@@ -16,6 +16,7 @@ import { AssistantStreamAccumulator } from '@deepseek-ai/dsh-llm/assistant-strea
 import { LlmAttemptId } from '@deepseek-ai/dsh-llm/brand'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
 import { hasAssistantReplyContent } from '../src/client/contract/assistant-content.ts'
+import { latestTtftMs } from '../src/client/chat/StatsPills.tsx'
 import { assistantDefinition } from '../src/client/conversation-nodes/assistant.ts'
 import { chatViewDefinition } from '../src/client/conversation-nodes/chat-snapshot-builder.ts'
 import { commandDefinition } from '../src/client/conversation-nodes/command.ts'
@@ -1206,7 +1207,9 @@ describe('built-in conversation node Definitions', () => {
         failure: { code: 'TRANSPORT', message: 'temporary' },
       }),
     ])
-    expect(node(snapshot(hiddenValue), 'assistant-step')).toBeUndefined()
+    expect(node(snapshot(hiddenValue), 'assistant-step')?.visibility).not.toBe('visible')
+    // The step is still open: the retry restarts its wait.
+    expect(node(snapshot(hiddenValue), 'assistant-step')?.data).toMatchObject({ waitingSince: 1_700_000_000_022 })
 
     const toolOnlyValue = assembler([
       at(30, 'turn/start', { turn: 4 }),
@@ -2566,7 +2569,9 @@ describe('built-in conversation node Definitions', () => {
     const current = snapshot(value)
     expect(node(current, 'user')).toBeUndefined()
     expect(node(current, 'context')).toBeUndefined()
-    expect(node(current, 'assistant-step')).toBeUndefined()
+    expect(node(current, 'assistant-step')?.visibility).not.toBe('visible')
+    // Replacement copies are not matched, so the open step still waits for its first token.
+    expect(node(current, 'assistant-step')?.data).toMatchObject({ waitingSince: 1_700_000_000_002 })
     expect((node(current, 'tool-call')?.data as ToolChatData).root).not.toHaveProperty('kind')
   })
 
@@ -3006,4 +3011,179 @@ it('keeps user cancellations and forked endings free of a failure row', () => {
     const value = assembler([at(7, 'turn/end', { turn: 1, reason })], true)
     expect(node(snapshot(value), 'turn-error')).toBeUndefined()
   }
+})
+
+describe('assistant waiting signal', () => {
+  const BASE = 1_700_000_000_000
+  const waiting = (value: ConversationNodeAssembler): number | undefined =>
+    snapshot(value).nodes.turnDataSource(1, 'assistant-step').getSnapshot().at(-1)?.waitingSince
+  const retryEvent = (seq: number) => at(seq, 'llm/retry', {
+    retryId: `retry-${seq}`, turn: 1, step: 1, provider: 'fake', mode: 'normal',
+    policyKey: 'fake-normal', retry: 1, maxRetries: 2, delayMs: 10,
+    failure: { code: 'TRANSPORT', message: 'temporary' },
+  })
+
+  it.each([
+    ['reasoning', { type: 'reasoning-delta', index: 0, text: 'hm' }],
+    ['text', { type: 'text-delta', index: 0, text: 'hi' }],
+    ['tool-call', { type: 'tool-call-delta', index: 0, id: 'c1', name: 'run', argumentsDelta: '{' }],
+  ] as const)('is published from step start until the first %s delta', (_name, chunk) => {
+    const value = assembler([at(1, 'turn/start', { turn: 1 }), at(2, 'step/start', { turn: 1, step: 1 })])
+    expect(waiting(value)).toBe(BASE + 2)
+    value.append(at(3, 'assistant/live-chunk', { turn: 1, step: 1, chunk }))
+    value.flush()
+    expect(waiting(value)).toBeUndefined()
+  })
+
+  it('keeps waiting through chunks that carry no token', () => {
+    const value = assembler([at(1, 'turn/start', { turn: 1 }), at(2, 'step/start', { turn: 1, step: 1 })])
+    value.append(at(3, 'assistant/live-chunk', { turn: 1, step: 1, chunk: { type: 'block-start', index: 0, blockType: 'text' } }))
+    value.flush()
+    expect(waiting(value)).toBe(BASE + 2)
+  })
+
+  it('restarts the wait at an llm/retry without touching the settled first-token time', () => {
+    const value = assembler([at(1, 'turn/start', { turn: 1 }), at(2, 'step/start', { turn: 1, step: 1 })])
+    value.append(at(3, 'assistant/live-chunk', {
+      turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'hi' },
+    }))
+    value.append(retryEvent(4))
+    value.flush()
+    expect(waiting(value)).toBe(BASE + 4)
+    value.append(at(5, 'assistant/live-chunk', {
+      turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'again' },
+    }))
+    value.append(at(6, 'assistant/message', {
+      turn: 1, step: 1, message: assistantMessage('m1', 'again'),
+    }, { surfaceOp: 'append' }))
+    value.flush()
+    const settled = snapshot(value).nodes.turnDataSource(1, 'assistant-step').getSnapshot().at(-1)
+    expect(settled?.waitingSince).toBeUndefined()
+    expect(settled?.finalNode?.timing).toEqual({
+      stepStartTime: BASE + 2, firstTokenTime: BASE + 3, completedTime: BASE + 6,
+    })
+  })
+
+  it.each([
+    ['step end', [at(3, 'step/end', { turn: 1, step: 1 })]],
+    ['user interrupt', [at(3, 'turn/end', { turn: 1, reason: { kind: 'interrupted' } })]],
+    ['error before any token', [
+      at(3, 'turn/end', { turn: 1, reason: { kind: 'error', error: { code: 'TRANSPORT', message: 'failed' } } }),
+    ]],
+  ])('stops waiting when the turn closes without a token (%s)', (_name, closing) => {
+    const value = assembler([at(1, 'turn/start', { turn: 1 }), at(2, 'step/start', { turn: 1, step: 1 })])
+    expect(waiting(value)).toBe(BASE + 2)
+    for (const event of closing) value.append(event)
+    value.flush()
+    expect(waiting(value)).toBeUndefined()
+  })
+
+  it('follows the latest step when a turn runs two steps', () => {
+    const value = assembler([
+      at(1, 'turn/start', { turn: 1 }), at(2, 'step/start', { turn: 1, step: 1 }),
+      at(3, 'assistant/live-chunk', { turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text: 'a' } }),
+      at(4, 'assistant/message', { turn: 1, step: 1, message: assistantMessage('m1', 'a') }, { surfaceOp: 'append' }),
+      at(5, 'step/end', { turn: 1, step: 1 }),
+      at(6, 'step/start', { turn: 1, step: 2 }),
+    ])
+    const steps = snapshot(value).nodes.turnDataSource(1, 'assistant-step').getSnapshot()
+    expect(steps.at(-1)).toMatchObject({ step: 2, waitingSince: BASE + 6 })
+    expect(steps.find(step => step.step === 1)?.waitingSince).toBeUndefined()
+    value.append(at(7, 'assistant/live-chunk', { turn: 1, step: 2, chunk: { type: 'text-delta', index: 0, text: 'b' } }))
+    value.flush()
+    expect(waiting(value)).toBeUndefined()
+  })
+
+  it('is absent once the step settles without any token', () => {
+    const value = assembler([
+      at(1, 'turn/start', { turn: 1 }), at(2, 'step/start', { turn: 1, step: 1 }),
+      at(3, 'assistant/message', { turn: 1, step: 1, message: assistantMessage('m1', 'x') }, { surfaceOp: 'append' }),
+    ])
+    expect(waiting(value)).toBeUndefined()
+  })
+})
+
+describe('assistant first-token display through durable settlement', () => {
+  const textChunk = { type: 'text-delta' as const, index: 0, text: 'Answer' }
+  const streamOf = (time: number) => {
+    const stream = new AssistantStreamAccumulator()
+    stream.push({ time, chunk: textChunk })
+    return stream.snapshot()
+  }
+  const settlement = (stream: ReturnType<typeof streamOf>) => {
+    const event = at(3, 'assistant/message', {
+      turn: 1, step: 1, message: assistantMessage('m1', 'Answer'), stream,
+    }, { surfaceOp: 'append', time: 1_050 }).event
+    if (event.type !== 'assistant/message') throw new Error('expected Assistant settlement')
+    return { type: 'event' as const, event }
+  }
+  const starts = () => [
+    at(1, 'turn/start', { turn: 1 }, { time: 1_000 }),
+    at(2, 'step/start', { turn: 1, step: 1 }, { time: 1_010 }),
+  ]
+
+  it('reads the latest step TTFT from the durable stream after live settlement and reopening', () => {
+    const attemptId = LlmAttemptId('ttft-display')
+    const value = assembler(starts())
+    value.append({
+      type: 'transient',
+      event: { type: 'assistant/live-chunk', seq: 2.5, time: 1_030, data: { attemptId, turn: 1, step: 1, chunk: textChunk } },
+    })
+    value.flush()
+    const entry = settlement(streamOf(1_030))
+    value.settleAssistant(attemptId, entry)
+    value.flush()
+    const reopened = assembler([...starts(), entry])
+    for (const current of [value, reopened]) {
+      const final = (node(snapshot(current), 'assistant-step')?.data as AssistantChatData).finalNode
+      expect(final?.timing).toMatchObject({ stepStartTime: 1_010, completedTime: 1_050 })
+      expect(final).toMatchObject({ firstTokenLatencyMs: 20 })
+      expect(latestTtftMs(snapshot(current).legacy.nodes)).toBe(20)
+    }
+  })
+
+  it('stops waiting when a settled attempt already carries a token, and re-arms at its retry', () => {
+    const attempt = at(3, 'assistant/attempt', { turn: 1, step: 1, stream: streamOf(1_030) }, { time: 1_040 })
+    const value = assembler([...starts(), attempt])
+    const waitingSince = () => snapshot(value).nodes.turnDataSource(1, 'assistant-step').getSnapshot().at(-1)?.waitingSince
+    expect(waitingSince()).toBeUndefined()
+    value.append(at(4, 'llm/retry', {
+      retryId: 'r1', turn: 1, step: 1, provider: 'fake', mode: 'normal', policyKey: 'fake-normal',
+      retry: 1, maxRetries: 2, delayMs: 10, failure: { code: 'TRANSPORT', message: 'temporary' },
+    }, { time: 1_060 }))
+    value.flush()
+    expect(waitingSince()).toBe(1_060)
+  })
+
+  it('clears the wait on a retried tool call whose first delta carried no token', () => {
+    const value = assembler(starts())
+    const waitingSince = () => snapshot(value).nodes.turnDataSource(1, 'assistant-step').getSnapshot().at(-1)?.waitingSince
+    const chunk = (seq: number, body: unknown) => at(seq, 'assistant/live-chunk', { turn: 1, step: 1, chunk: body })
+    value.append(chunk(3, { type: 'text-delta', index: 0, text: 'hi' }))
+    value.append(at(4, 'llm/retry', {
+      retryId: 'r2', turn: 1, step: 1, provider: 'fake', mode: 'normal', policyKey: 'fake-normal',
+      retry: 1, maxRetries: 2, delayMs: 10, failure: { code: 'TRANSPORT', message: 'temporary' },
+    }))
+    value.append(chunk(5, { type: 'tool-call-delta', index: 0, id: 'c1', argumentsDelta: '' }))
+    value.flush()
+    expect(waitingSince()).toBe(1_700_000_000_000 + 4)
+    value.append(chunk(6, { type: 'tool-call-delta', index: 0, id: 'c1', argumentsDelta: '{' }))
+    value.flush()
+    expect(waitingSince()).toBeUndefined()
+  })
+
+  it('leaves no wait behind when settlement retires the live chunks of a token-less attempt', () => {
+    const attemptId = LlmAttemptId('abandoned-wait')
+    const value = assembler(starts())
+    value.append({
+      type: 'transient',
+      event: { type: 'assistant/live-chunk', seq: 2.5, time: 1_030, data: { attemptId, turn: 1, step: 1, chunk: textChunk } },
+    })
+    value.flush()
+    value.settleAssistant(attemptId, settlement(streamOf(1_030)))
+    value.flush()
+    const settled = snapshot(value).nodes.turnDataSource(1, 'assistant-step').getSnapshot().at(-1)
+    expect(settled?.status).toBe('settled')
+    expect(settled).not.toHaveProperty('waitingSince')
+  })
 })

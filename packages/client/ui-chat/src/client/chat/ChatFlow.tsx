@@ -8,6 +8,7 @@ import { ChatGroupSeat } from './ChatGroupSeat.tsx'
 import { PendingSteeringBubble, PendingSubmissionBubble } from './MessageItem.tsx'
 import { chatRenderKey } from './render-entry.ts'
 import { RunningStatus } from './RunningStatus.tsx'
+import { useWaitingSince } from './use-waiting-since.ts'
 
 /** A local submission echo, or a Host-pending steering item without a local submission. */
 type PendingInput = ChatFlowSlotProps['pendingInputs'][number]
@@ -44,6 +45,8 @@ export const ChatFlow = memo(function ChatFlow({
     return (location?.kind === 'turn' || location?.kind === 'step') && location.turn.status === 'open'
   })
   const holding = !running && latestTurnOpen
+  const latestTurn = useChat(snapshot => snapshot.navigation.items().at(-1)?.turn)
+  const waitingSince = useWaitingSince(nodeStore, latestTurn)
   const seatProps = {
     nodeStore, useChatNode, useChatNodeBottom, useChatNodeProcess, usePresentation,
     useStore, actions, renderSlot, t, useGroupAction, deferCollapse,
@@ -93,7 +96,7 @@ export const ChatFlow = memo(function ChatFlow({
   // the status slot (hidden) until its actions row takes the slot in the same commit.
   return [
     ...rows, ...leadingRows, ...openingRows,
-    ...running || holding ? [<RunningStatus key="running" startTime={runningStartTime} paused={disconnected}
+    ...running || holding ? [<RunningStatus key="running" startTime={runningStartTime} waitingSince={waitingSince} paused={disconnected}
       holding={holding} t={t} />] : [],
     ...pendingRows,
   ]

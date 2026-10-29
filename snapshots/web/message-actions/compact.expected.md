@@ -1,1 +1,1 @@
-- text: {{throughput}} tok/s Cache hit 98%
+- text: {{throughput}} tok/s TTFT {{duration}} Cache hit 98%
