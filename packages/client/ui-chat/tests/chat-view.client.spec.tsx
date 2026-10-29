@@ -2,7 +2,7 @@
 
 import type { ProcessGroupData } from '../src/client/contract/process-groups.ts'
 import type { InboxState } from '@deepseek-ai/dsh-agent/types'
-import { MessageId } from '@deepseek-ai/dsh-llm/brand'
+import { LlmAttemptId, MessageId } from '@deepseek-ai/dsh-llm/brand'
 import type { GlobalStandardProps, PropsRenderFactories, PropsRenderSlots } from '@deepseek-ai/dsh-client-ui-slots'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
@@ -16,7 +16,7 @@ import type {
   TranscriptViewMode, UserContentInput, UserMessageNode,
 } from '@deepseek-ai/dsh-client-ui-chat/client'
 import type {
-  SessionListState, SessionSnapshot,
+  SessionEventLikeEntry, SessionListState, SessionSnapshot,
 } from '@deepseek-ai/dsh-api-session-controller/client'
 import type {
   ConversationGroupedView,
@@ -58,6 +58,26 @@ import { installTurnNavigatorObserver } from './turn-navigator-fixture.ts'
 import { renderReasoningSlot } from './reasoning-component-fixture.tsx'
 import { createUserContentFixture } from './user-content-component-fixture.tsx'
 import { ConversationGroupStore } from '../../ui-conversation/src/client/conversation/group-store.ts'
+import {
+  ConversationNodeAssembler, type ConversationNodeDefinition, type ConversationViewDefinition,
+} from '@deepseek-ai/dsh-client-ui-conversation/client'
+import { assistantDefinition } from '../src/client/conversation-nodes/assistant.ts'
+import { chatViewDefinition } from '../src/client/conversation-nodes/chat-snapshot-builder.ts'
+import { unknownFallbackDefinition } from '../src/client/conversation-nodes/fallback.ts'
+import { processEvidenceDefinition, turnProcessDefinition } from '../src/client/conversation-nodes/turn-process.ts'
+import { turnTailDefinition } from '../src/client/conversation-nodes/turn-tail.ts'
+
+/** Counts ChatFlow renders: the hook runs once per ChatFlow render. */
+const flowRenders = vi.hoisted(() => ({ count: 0 }))
+vi.mock('../src/client/chat/use-waiting-since.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/client/chat/use-waiting-since.ts')>()
+  return {
+    useWaitingSince: (...args: Parameters<typeof actual.useWaitingSince>) => {
+      flowRenders.count++
+      return actual.useWaitingSince(...args)
+    },
+  }
+})
 
 function installGroupedSnapshot(
   builder: ChatSnapshotBuilder, state: ProcessState, groups: ConversationGroupStore<ProcessGroupData>, source: ChatSnapshot,
@@ -136,6 +156,7 @@ function makeSessionSource(init: Partial<TestSessionSnapshot> = {}) {
 
 type ChatSlice = Partial<LegacyConversationSlice> & {
   readonly turnUsages?: NonNullable<Parameters<typeof chatSnapshotFixture>[0]>['turnUsages']
+  readonly waiting?: NonNullable<NonNullable<Parameters<typeof chatSnapshotFixture>[0]>['waiting']>
 }
 type HarnessUpdate = ChatSlice & Partial<TestSessionSnapshot> & { readonly chat?: ChatSnapshot }
 
@@ -384,7 +405,7 @@ function makeHarness(
   chatSnapshot?: ChatSnapshot,
 ) {
   const {
-    chat: initialChat, nodes, partial, runningCalls, turnTimings, turnEnds, turnUsages,
+    chat: initialChat, nodes, partial, runningCalls, turnTimings, turnEnds, turnUsages, waiting,
     ...sessionInit
   } = init
   const chatSlice: ChatSlice = {
@@ -394,6 +415,7 @@ function makeHarness(
     ...(turnTimings === undefined ? {} : { turnTimings }),
     ...(turnEnds === undefined ? {} : { turnEnds }),
     ...(turnUsages === undefined ? {} : { turnUsages }),
+    ...(waiting === undefined ? {} : { waiting }),
   }
   const session = makeSessionSource({ ...sessionInit, ...sessionOverrides })
   const useTestSession = bindSnapshotSelector(session.source)
@@ -4675,6 +4697,58 @@ describe('ChatView', () => {
     act(() => { h.setChat({ turnEnds: new Map([[1, 2]]) }) })
     expect(column.querySelector('[data-chat-running]')).toBeNull()
   })
+
+  it('swaps the running label for a ticking first-token wait until a token arrives', withClock(5_000, () => {
+    const h = makeHarness({
+      nodes: [userInTurn(1, 'do the thing', 1)],
+      turnTimings: new Map([[1, { startTime: 1_000 }]]),
+      waiting: { turn: 1, step: 1, since: 2_000 },
+    }, { running: true })
+    const view = render(<h.ChatView {...h.props} />)
+    expect(runningContent(view.container)?.textContent).toBe('等待首个 token：1秒 ···')
+    act(() => { vi.advanceTimersByTime(2_000) })
+    expect(runningContent(view.container)?.textContent).toBe('等待首个 token：2秒 ···')
+    // The first token clears the step's wait; the Turn clock label returns.
+    act(() => { h.setChat({}) })
+    expect(runningContent(view.container)?.textContent).toBe('深度求索中，用时 6秒 ···')
+    // A retry publishes a later start, restarting the wait.
+    act(() => { h.setChat({ waiting: { turn: 1, step: 1, since: 6_000 } }) })
+    expect(runningContent(view.container)?.textContent).toBe('等待首个 token：1秒 ···')
+  }))
+
+  it('does not re-render the flow per streamed delta, only when the waiting state changes', withClock(5_000, () => {
+    const definitions: readonly ConversationNodeDefinition[] = [
+      assistantDefinition, turnProcessDefinition, processEvidenceDefinition, turnTailDefinition,
+    ]
+    const assembler = new ConversationNodeAssembler(
+      { entries: () => definitions, fallbackEntry: () => unknownFallbackDefinition },
+      { entries: (): readonly ConversationViewDefinition[] => [chatViewDefinition] },
+    )
+    const attemptId = LlmAttemptId('flow-render-count')
+    assembler.replaceWindow([
+      { type: 'event', event: { seq: SessionSeq(1), time: 1_001, type: 'turn/start', data: { turn: 1 } } },
+      { type: 'event', event: { seq: SessionSeq(2), time: 1_002, type: 'step/start', data: { turn: 1, step: 1 } } },
+    ], false)
+    assembler.activateTarget('chat')
+    const delta = (seq: number, text: string): SessionEventLikeEntry => ({
+      type: 'transient',
+      event: {
+        type: 'assistant/live-chunk', seq: SessionSeq(seq), time: 1_000 + seq,
+        data: { attemptId, turn: 1, step: 1, chunk: { type: 'text-delta', index: 0, text } },
+      },
+    })
+    const h = makeHarness({ chat: assembler.snapshot('chat') as ChatSnapshot }, { running: true })
+    const view = render(<h.ChatView {...h.props} />)
+    expect(runningContent(view.container)?.textContent).toMatch(/^等待首个 token/)
+    // The first token ends the wait: one more render is allowed.
+    act(() => { assembler.append(delta(3, 'a')); assembler.flush() })
+    expect(runningContent(view.container)?.textContent).not.toMatch(/^等待首个 token/)
+    const afterFirst = flowRenders.count
+    for (const [index, text] of ['b', 'c', 'd', 'e'].entries()) {
+      act(() => { assembler.append(delta(4 + index, text)); assembler.flush() })
+    }
+    expect(flowRenders.count).toBe(afterFirst)
+  }))
 
   it('marks the steering row whose data carries a batch start, and no other input', () => {
     const batchStart = (seq: number, text: string) => ({ ...steering(seq, text, 1), batchStart: true as const })

@@ -4,12 +4,13 @@ import type {
   ChatTurnProcessPresentation, CompactionSummaryNode, FinalAssistantChatData, LegacyConversationSlice,
   PartialAssistant, RunningToolCall, ToolCallBlock, TurnNavigationItem,
 } from '@deepseek-ai/dsh-client-ui-chat/client'
+import type { ObservableSnapshot } from '@deepseek-ai/dsh-client-store'
 import type {
   ConversationLocationDataSource, ConversationLocationDataStore, ConversationTurnDataMap, TurnLocation,
 } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import { SessionSeq } from '@deepseek-ai/dsh-session/types'
 import type { TurnEndReason } from '@deepseek-ai/dsh-session/types'
-import type { TurnTokenUsage } from '../src/client/contract/chat-nodes.ts'
+import type { ChatNodeDataMap, ChatNodeKind, TurnTokenUsage } from '../src/client/contract/chat-nodes.ts'
 import {
   sameTurnNavigationItem, turnNavigationItem,
 } from '../src/client/conversation-nodes/turn-navigation.ts'
@@ -108,6 +109,7 @@ class FixtureNodeStore implements ChatNodeStore {
   private readonly sources = new Map<string, FixtureSource<ChatConversationViewNode | undefined>>()
   private readonly processSources = new Map<string, FixtureSource<ChatTurnProcessPresentation | undefined>>()
   private readonly bottomSources = new Map<string, FixtureSource<boolean>>()
+  private readonly turnSources = new Map<string, FixtureSource<readonly unknown[]>>()
   /** First Turn of the latest loaded exchange. */
   bottomStart: number | undefined
   private readonly dirtyKeys = new Set<string>()
@@ -130,8 +132,20 @@ class FixtureNodeStore implements ChatNodeStore {
     }))
   }
 
-  turnDataSource(): never {
-    throw new Error('turn collections require the real ChatSnapshotBuilder')
+  turnDataSource<Kind extends ChatNodeKind>(turn: number, kind: Kind): ObservableSnapshot<readonly ChatNodeDataMap[Kind][]> {
+    const key = `${turn}:${kind}`
+    return cachedSource(this.turnSources, key, () => {
+      let current: readonly unknown[] = EMPTY
+      return new FixtureSource(() => {
+        const next = this.list
+          .filter(node => node.kind === kind && (node.location.kind === 'turn' || node.location.kind === 'step')
+            && node.location.turn.turn === turn)
+          .sort((left, right) => left.anchorSeq - right.anchorSeq)
+          .map(node => node.data)
+        if (!sameValues(current, next)) current = next
+        return current
+      })
+    }) as ObservableSnapshot<readonly ChatNodeDataMap[Kind][]>
   }
 
   processSource(key: string): ChatNodeProcessSource {
@@ -188,6 +202,7 @@ class FixtureNodeStore implements ChatNodeStore {
     for (const key of dirty) this.sources.get(key)?.publish()
     for (const key of dirtyProcesses) this.processSources.get(key)?.publish()
     for (const source of this.bottomSources.values()) source.publish()
+    for (const source of this.turnSources.values()) source.publish()
   }
 }
 
@@ -304,6 +319,8 @@ function settledNode(
 export function chatSnapshotFixture(input: {
   readonly nodes?: readonly ConversationNode[]
   readonly partial?: PartialAssistant | null
+  /** A step that has started but produced no token: the hidden Assistant Node the real builder keeps for it. */
+  readonly waiting?: { readonly turn: number; readonly step: number; readonly since: number }
   readonly runningCalls?: readonly RunningToolCall[]
   readonly turnTimings?: LegacyConversationSlice['turnTimings']
   /** Recorded ends exist without starts; missing end times follow the fixture's seq × 1000 convention. */
@@ -325,6 +342,7 @@ export function chatSnapshotFixture(input: {
     if ('turn' in node && typeof node.turn === 'number') turnNumbers.add(node.turn)
   }
   if (legacy.partial !== null) turnNumbers.add(legacy.partial.turn)
+  if (input.waiting !== undefined) turnNumbers.add(input.waiting.turn)
   for (const call of legacy.runningCalls) turnNumbers.add(call.turn)
   const turns = new Map<number, TurnLocation>()
   const turnData = new Map<number, FixtureTurnDataStore>()
@@ -394,6 +412,20 @@ export function chatSnapshotFixture(input: {
         blocks: legacy.partial.blocks,
         time: 0,
       },
+    })
+  }
+  if (input.waiting !== undefined) {
+    const { turn: turnNumber, step, since } = input.waiting
+    const turn = turns.get(turnNumber)
+    nodes.push({
+      key: `fixture:assistant:${turnNumber}:${step}`,
+      id: `${turnNumber}:${step}`,
+      target: 'chat',
+      kind: 'assistant-step',
+      anchorSeq: Number.MAX_SAFE_INTEGER - 2,
+      location: turn === undefined ? { kind: 'session' } : { kind: 'turn', turn },
+      visibility: 'hidden',
+      data: { status: 'running', turn: turnNumber, step, blocks: [], time: 0, waitingSince: since },
     })
   }
   for (const call of legacy.runningCalls) {
@@ -526,7 +558,8 @@ export function chatSnapshotFixture(input: {
   nodes.sort((left, right) => left.anchorSeq - right.anchorSeq || left.key.localeCompare(right.key))
   const ordered = orderedVisibleChatNodes(nodes)
   const store = previous?.nodes instanceof FixtureNodeStore ? previous.nodes : new FixtureNodeStore()
-  store.replace(ordered)
+  // The real store also holds hidden Nodes (a step awaiting its first token) outside the render order.
+  store.replace([...ordered, ...nodes.filter(node => node.visibility === 'hidden')])
   const byKey = new Map(store.values().map(node => [node.key, node]))
   const nextOrder = ordered.map(node => node.key)
   const order = previous !== undefined && sameValues(previous.order, nextOrder) ? previous.order : nextOrder

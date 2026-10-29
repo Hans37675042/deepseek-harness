@@ -80,3 +80,48 @@ describe('RunningStatus', () => {
     expect(vi.getTimerCount()).toBe(1)
   })
 })
+
+describe('RunningStatus waiting for the first token', () => {
+  const waitingView = (waitingSince?: number, paused = false, holding = false) =>
+    <RunningStatus startTime={1_000} waitingSince={waitingSince} paused={paused} holding={holding} t={t} />
+
+  it('replaces the running label with a ticking wait from the attempt start, then restores it', () => {
+    const view = render(waitingView(2_000))
+    const content = () => view.container.querySelector('[data-chat-running] > :last-child')
+    // Anchored to the local clock when the wait appears, so the Host event time (2_000) does not matter.
+    expect(content()?.textContent).toBe('等待首个 token：1秒 ···')
+    act(() => { vi.advanceTimersByTime(2_000) })
+    expect(content()?.textContent).toBe('等待首个 token：2秒 ···')
+    expect(vi.getTimerCount()).toBe(1)
+    view.rerender(waitingView(undefined))
+    expect(content()?.textContent).toBe('深度求索中，用时 6秒 ···')
+  })
+
+  it('restarts the shown wait when a retry moves the attempt start', () => {
+    const view = render(waitingView(2_000))
+    act(() => { vi.advanceTimersByTime(4_000) })
+    view.rerender(waitingView(9_000))
+    expect(view.container.querySelector('[data-chat-running] > :last-child')?.textContent).toBe('等待首个 token：1秒 ···')
+  })
+
+  it('clears its interval on unmount and when the wait ends', () => {
+    const view = render(waitingView(2_000))
+    expect(vi.getTimerCount()).toBe(1)
+    view.unmount()
+    expect(vi.getTimerCount()).toBe(0)
+    const noClock = render(<RunningStatus startTime={undefined} waitingSince={2_000} paused={false} t={t} />)
+    expect(vi.getTimerCount()).toBe(1)
+    noClock.rerender(<RunningStatus startTime={undefined} waitingSince={undefined} paused={false} t={t} />)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it('keeps the paused and holding behaviour', () => {
+    const view = render(waitingView(2_000, true))
+    expect(vi.getTimerCount()).toBe(0)
+    act(() => { vi.advanceTimersByTime(5_000) })
+    expect(view.container.querySelector('[data-chat-running] > :last-child')?.textContent).toBe('等待首个 token：1秒 ···')
+    view.rerender(waitingView(2_000, false, true))
+    expect(vi.getTimerCount()).toBe(0)
+    expect(view.container.querySelector('[data-chat-running]')?.getAttribute('aria-hidden')).toBe('true')
+  })
+})

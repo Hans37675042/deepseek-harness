@@ -9,7 +9,7 @@ import { bindSnapshotSelector, makeTranslate } from '@deepseek-ai/dsh-client-tes
 import { en as commonEn } from '@deepseek-ai/dsh-client-locale/src/locales/en.ts'
 import { zh as commonZh } from '@deepseek-ai/dsh-client-locale/src/locales/zh.ts'
 import { PartialArguments } from '@deepseek-ai/dsh-util-values'
-import { ActivityPill, UsagePill, deriveStats, formatDuration, type StatPillProps } from '../src/client/chat/StatsPills.tsx'
+import { ActivityPill, UsagePill, deriveStats, formatDuration, latestTtftMs, type StatPillProps } from '../src/client/chat/StatsPills.tsx'
 import { formatTokens } from '../src/client/chat/token-format.ts'
 import { en, zh } from '../src/client/locale.ts'
 import { chatSnapshotFixture } from './chat-snapshot-fixture.client.ts'
@@ -174,9 +174,9 @@ describe('composer stats pills', () => {
   it('compact keeps only speed and cache hit, with no interactive statistics', () => {
     const { source } = makeSource({ nodes: [timedStep()] })
     const view = render(<StatsPills {...props(source)} usePerformanceUsage={selector => selector('compact')} />)
-    expect(view.container.textContent).toBe('20 tok/sCache hit 90%')
+    expect(view.container.textContent).toBe('20 tok/s ·TTFT 0.8sCache hit 90%')
     expect(view.queryByRole('button')).toBeNull()
-    fireEvent.mouseOver(view.getByText('20 tok/s'))
+    fireEvent.mouseOver(view.getByText(/20 tok\/s/))
     expect(view.queryByRole('dialog')).toBeNull()
     view.rerender(<StatsPills {...props(source)} />)
     expect(view.getAllByRole('button')).toHaveLength(2)
@@ -239,8 +239,8 @@ describe('composer stats pills', () => {
     const { source } = makeSource({ nodes: [timedStep()] })
     const view = render(<StatsPills {...props(source)} />)
     const timePill = view.getAllByRole('button')[0]!
-    expect(timePill.textContent).toBe('1 turns 1 steps·20 tok/s')
-    expect(timePill.getAttribute('aria-label')).toBe('1 turns 1 steps · 20 tok/s')
+    expect(timePill.textContent).toBe('1 turns 1 steps·20 tok/s ·TTFT 0.8s')
+    expect(timePill.getAttribute('aria-label')).toBe('1 turns 1 steps · 20 tok/s · TTFT 0.8s')
   })
 
   it('marks each pill with its dock entry id', () => {
@@ -248,7 +248,7 @@ describe('composer stats pills', () => {
     const view = render(<StatsPills {...props(source)} />)
     const pills = [...view.container.querySelectorAll('[data-composer-stat]')]
     expect(pills.map(pill => [pill.getAttribute('data-composer-stat'), pill.textContent])).toEqual([
-      ['activity', '1 turns 1 steps·20 tok/s'],
+      ['activity', '1 turns 1 steps·20 tok/s ·TTFT 0.8s'],
       ['usage', '105 tok·Cache hit 90%'],
     ])
   })
@@ -359,7 +359,7 @@ describe('composer stats pills', () => {
     const { source } = makeSource({ nodes: [timedStep()] })
     const view = render(<StatsPills {...props(source, { tokenUsage: tokenUsage(9_995, 5) })} t={t} />)
     const [timePill, usagePill] = [...view.getAllByRole('button')] as [HTMLElement, HTMLElement]
-    expect(timePill.textContent).toBe('1 轮 1 步·20 tok/s')
+    expect(timePill.textContent).toBe('1 轮 1 步·20 tok/s ·TTFT 0.8秒')
     // Whole-log total 9995 + 5 + 1 compacts to 10K.
     expect(usagePill.textContent).toBe('10K tok·缓存命中 99.95%')
     fireEvent.click(timePill)
@@ -551,5 +551,93 @@ describe('composer stats pills', () => {
     act(() => { set({ partial: { turn: 1, step: 2, blocks: [{ kind: 'text', text: 'a' }] } }) })
     act(() => { set({ partial: { turn: 1, step: 2, blocks: [{ kind: 'text', text: 'ab' }] } }) })
     expect(renders).toBe(before)
+  })
+})
+
+describe('latest step TTFT', () => {
+  const timed = (seq: number, firstTokenTime: number | null, stepStartTime: number | null = seq * 1_000): AssistantMessageNode => ({
+    ...assistant(seq, 1),
+    timing: { stepStartTime, firstTokenTime, completedTime: seq * 1_000 + 5_000 },
+  })
+
+  it('reads the most recent settled step that recorded a TTFT', () => {
+    expect(latestTtftMs([timed(1, 1_800), timed(2, 2_300)])).toBe(300)
+  })
+
+  it('skips steps without timing or without a first token', () => {
+    expect(latestTtftMs([timed(1, 1_800), assistant(2, 1), timed(3, null), timed(4, 4_500, null)])).toBe(800)
+  })
+
+  it('is null when no step recorded a TTFT', () => {
+    expect(latestTtftMs([assistant(1, 1)])).toBeNull()
+    expect(latestTtftMs([])).toBeNull()
+  })
+})
+
+describe('latest TTFT on the activity pill', () => {
+  const USAGE = { uncachedInputTokens: 10, outputTokens: 5, cacheReadTokens: 90, cacheWriteTokens: 0 }
+  const step = (seq: number, ttft: number): AssistantMessageNode => ({
+    ...assistant(seq, 1, { outputTokens: 60 }),
+    timing: { stepStartTime: seq * 10_000, firstTokenTime: seq * 10_000 + ttft, completedTime: seq * 10_000 + ttft + 3_000 },
+  })
+  const props = (source: ReturnType<typeof makeSource>['source']): StatPillProps => ({
+    usePerformanceUsage: selector => selector('detailed'),
+    useChat: bindSnapshotSelector(source),
+    useProjection: (key: string) => (key === 'tokenUsage' ? USAGE : undefined),
+    t: tEn,
+  })
+
+  it('shows the newest step TTFT beside tok/s and a dialog row next to the average', () => {
+    const { source } = makeSource({ nodes: [step(1, 800), step(2, 3_200)] })
+    const view = render(<StatsPills {...props(source)} />)
+    const pill = view.getAllByRole('button')[0]!
+    expect(pill.textContent).toBe('1 turns 2 steps·20 tok/s ·TTFT 3.2s')
+    expect(pill.getAttribute('aria-label')).toBe('1 turns 2 steps · 20 tok/s · TTFT 3.2s')
+    fireEvent.click(pill)
+    const details = view.getByRole('dialog').querySelector('[data-session-stats-details]') as HTMLElement
+    expect(details.textContent).toContain('Avg time to first token (TTFT)2s')
+    expect(details.textContent).toContain('Latest time to first token (TTFT)3.2s')
+  })
+
+  /** Text an accessibility tree exposes: aria-hidden subtrees drop out. */
+  function accessibleText(node: Node): string {
+    if (node instanceof Element && node.getAttribute('aria-hidden') === 'true') return ''
+    return [...node.childNodes].map(child => child.nodeType === Node.TEXT_NODE ? child.textContent ?? '' : accessibleText(child)).join('')
+  }
+  const separators = (root: HTMLElement) => [...root.querySelectorAll('span')].filter(element => element.textContent === '·')
+
+  it('keeps tok/s and the TTFT reading apart in the accessible text while separators stay hidden', () => {
+    const { source } = makeSource({ nodes: [step(1, 800)] })
+    const view = render(<StatsPills {...props(source)} usePerformanceUsage={selector => selector('compact')} />)
+    const pill = view.container.querySelector<HTMLElement>('[data-composer-stat="activity"]')!
+    // Hidden separators would otherwise fuse the readings into "tok/sTTFT"; the scaffold normalizer needs "tok/s ".
+    expect(accessibleText(pill)).toBe('20 tok/s TTFT 0.8s')
+    expect(separators(pill).every(sep => sep.getAttribute('aria-hidden') === 'true')).toBe(true)
+  })
+
+  it('keeps the accessible text of a pill without TTFT as it was', () => {
+    const { source } = makeSource({ nodes: [assistant(1, 1)] })
+    const view = render(<ActivityPill {...props(source)} useProjection={(key: string) => (key === 'sessionStats'
+      ? { turns: 1, steps: 1, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 3_000, decodeTokens: 60 }
+      : undefined)} />)
+    const pill = view.container.querySelector<HTMLElement>('[data-composer-stat="activity"]')!
+    expect(accessibleText(pill)).toBe('1 turns 1 steps20 tok/s')
+    expect(separators(pill)).toHaveLength(1)
+    expect(separators(pill).every(sep => sep.getAttribute('aria-hidden') === 'true')).toBe(true)
+  })
+
+  it('keeps the TTFT in compact mode and localizes it', () => {
+    const { source } = makeSource({ nodes: [step(1, 800)] })
+    const view = render(<StatsPills {...props(source)} usePerformanceUsage={selector => selector('compact')} />)
+    expect(view.container.textContent).toBe('20 tok/s ·TTFT 0.8sCache hit 90%')
+    cleanup()
+    const zhView = render(<StatsPills {...props(source)} t={t} />)
+    expect(zhView.getAllByRole('button')[0]!.textContent).toBe('1 轮 1 步·20 tok/s ·TTFT 0.8秒')
+  })
+
+  it('omits the segment and row when no step recorded a TTFT', () => {
+    const { source } = makeSource({ nodes: [assistant(1, 1)] })
+    const view = render(<StatsPills {...props(source)} />)
+    expect(view.container.textContent).not.toContain('TTFT')
   })
 })

@@ -128,7 +128,7 @@
 - 'button "Access mode, current: Workspace Write"': Workspace Write
 - button "Select model, current DeepSeek-V4-Flash": DeepSeek-V4-Flash
 - button "Send message"
-- button "1 turns 1 steps"
+- button "1 turns 1 steps · TTFT {{duration}}": 1 turns 1 steps TTFT {{duration}}
 
 ## Literal quote body
 
