@@ -73,8 +73,8 @@ describe('web e2e: plugin manager', () => {
     if (await page.getByRole('dialog', { name: settings }).count() === 0) {
       await openSettings(page, language === 'en' ? 'zh' : 'en')
     }
-    await page.getByRole('dialog', { name: settings }).getByRole('button', { name: source }).click()
-    await page.getByRole('menuitem', { name: target }).click()
+    await page.getByRole('dialog', { name: settings }).getByRole('button', { name: source, exact: true }).click()
+    await page.getByRole('menuitem', { name: target, exact: true }).click()
     const dialog = page.getByRole('dialog', { name: language === 'en' ? 'Settings' : '设置' })
     await dialog.waitFor()
     await page.keyboard.press('Escape')

@@ -91,6 +91,16 @@ describe('document language', () => {
     await vi.waitFor(() => { expect(langOf()).toBe('en') })
   })
 
+  it('states zh-TW for Traditional Chinese and resolves it from a zh-Hant browser', async () => {
+    Object.defineProperty(navigator, 'languages', { value: ['zh-Hant-HK'], configurable: true })
+    // Boot waits for the converter, so the first render is already Traditional.
+    const { locale } = await bench()
+    expect(locale.getLocale().active).toBe('zh-TW')
+    expect(langOf()).toBe('zh-TW')
+    locale.setLocale('zh')
+    expect(langOf()).toBe('zh-CN')
+  })
+
   it('uses an external locale definition for the document language', async () => {
     const { locale } = await bench()
     locale.addLanguage({ id: 'pt-BR', label: 'Português', fallback: 'en' })

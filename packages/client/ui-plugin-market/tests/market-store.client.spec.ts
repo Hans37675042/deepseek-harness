@@ -42,7 +42,8 @@ const fail = (code: string, message: string, details: object): Promise<Answer<ne
 function setup(indexes: MarketIndexSummary[] = [{ url: A }, { url: B }]) {
   const ctx = new Context()
   onTestFinished(() => ctx.fiber.dispose())
-  ctx.provide('locale', new LocaleRuntime(ctx))
+  const locale = new LocaleRuntime(ctx)
+  ctx.provide('locale', locale)
   const state = { indexes }
   const market = {
     listIndexes: vi.fn(() => ok(state.indexes)),
@@ -56,7 +57,7 @@ function setup(indexes: MarketIndexSummary[] = [{ url: A }, { url: B }]) {
   new TestRemote(ctx, { pluginMarket: market, pluginRegistryProbe: probe })
   const controller = new DiscoverController(ctx, () => 'https://dsh.example/prefix/')
   const face = controller.face(text => typeof text === 'string' ? text : text.en)
-  return { controller, face, market, probe, state, snapshot: () => controller.store.getSnapshot() }
+  return { controller, face, market, probe, state, locale, snapshot: () => controller.store.getSnapshot() }
 }
 
 describe('DiscoverController', () => {
@@ -369,6 +370,21 @@ describe('detail reads', () => {
     expect(market.readEntryDetail.mock.calls).toEqual([
       [A, 'b', '1.0.0', 'en', { refresh: false, npmFileSources: ['npmmirror'] }], [B, 'e', '2.0.0', 'zh', { refresh: false, npmFileSources: [] }],
     ])
+  })
+
+  it('converts a zh-TW document to Taiwan Traditional and leaves other languages alone', async () => {
+    const { controller, face, market, locale } = setup()
+    locale.addLanguage({ id: 'zh-TW', label: '繁體中文', fallback: 'zh' })
+    locale.setLocale('zh-TW')
+    await locale.converterReady()
+    const SIMPLIFIED: PluginDetail = { status: 'found', origin: 'locale', markdown: '# 设置\n\n```\n设置\n```', document: brandString<PluginDetailDocumentId>('doc') }
+    market.readEntryDetail.mockImplementation(() => ok(SIMPLIFIED))
+    face.loadDetail(ENTRY, 'zh-TW')
+    face.loadDetail(ENTRY, 'zh')
+    await vi.waitFor(() => { expect(controller.details.getSnapshot()[detailKey(ENTRY, 'zh')]).toMatchObject({ status: 'ready' }) })
+    await vi.waitFor(() => { expect(controller.details.getSnapshot()[detailKey(ENTRY, 'zh-TW')]).toMatchObject({ status: 'ready' }) })
+    expect(controller.details.getSnapshot()[detailKey(ENTRY, 'zh-TW')]).toMatchObject({ detail: { markdown: '# 設定\n\n```\n设置\n```', document: 'doc' } })
+    expect(controller.details.getSnapshot()[detailKey(ENTRY, 'zh')]).toEqual({ status: 'ready', detail: SIMPLIFIED })
   })
 
   it('reports failures by reason and reads again on retry', async () => {

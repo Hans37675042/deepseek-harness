@@ -1,4 +1,4 @@
-import { SHIPPED_LOCALE_IDS } from '../../../../scripts/shipped-locales.ts'
+import { WEB_LOCALE_IDS } from '../../../../scripts/shipped-locales.ts'
 /** locale apply wiring: service + dictionaries provision, declaration-aware
  * Language row registration, snapshot projection into the row store, and
  * recovery after an HMR collapse of the declaring entry. */
@@ -112,6 +112,16 @@ describe('locale apply', () => {
     }
   })
 
+  it('offers zh-TW in the web UI but not behind the desktop locale bridge', async () => {
+    const web = await bench()
+    await web.ctx.plugin({ inject: [...inject], apply }).await()
+    expect((web.ctx.get('locale') as LocaleRuntime).getLocale().locales.map(l => l.id)).toContain('zh-TW')
+
+    const desktop = await bench()
+    vi.stubGlobal('__DSH_LOCALE__', { read: async () => ({ languages: ['en-US'], preference: null }), onChange: vi.fn() })
+    await desktop.ctx.plugin({ inject: [...inject], apply }).await()
+    expect((desktop.ctx.get('locale') as LocaleRuntime).getLocale().locales.map(l => l.id)).not.toContain('zh-TW')
+  })
   // These are wiring specs, not default-language specs. A fresh LocaleRuntime
   // with no jsdom `window` skips browser detection and opens on FALLBACK_LOCALE
   // (en); each test that reads localized copy stages its locale explicitly via
@@ -156,7 +166,7 @@ describe('locale apply', () => {
     const { entry, instance, face } = faceOf(b.slots)
     // The inject-time re-sync sealed the init window: the mirror is current.
     expect(instance.getSnapshot().active).toBe('en')
-    expect(instance.getSnapshot().options.map(o => o.id).sort()).toEqual([...SHIPPED_LOCALE_IDS].sort())
+    expect(instance.getSnapshot().options.map(o => o.id).sort()).toEqual([...WEB_LOCALE_IDS].sort())
     // Copy rides the standard locale seat: the entry declares the namespace.
     expect(entry.locale).toBe(SETTINGS_NS)
     expect(locale.bind(SETTINGS_NS)('language.title')).toBe('Language')
@@ -191,11 +201,12 @@ describe('locale apply', () => {
       { id: 'de', label: 'Deutsch' },
       { id: 'ru', label: 'Русский' },
       { id: 'pt', label: 'Português' },
+      { id: 'zh-TW', label: '繁體中文' },
       { id: 'it', label: 'Italiano' },
     ])
 
     await languagePack.dispose()
-    expect(instance.getSnapshot().options.map(option => option.id)).toEqual(['zh', 'en', 'ja', 'es', 'fr', 'de', 'ru', 'pt'])
+    expect(instance.getSnapshot().options.map(option => option.id)).toEqual(['zh', 'en', 'ja', 'es', 'fr', 'de', 'ru', 'pt', 'zh-TW'])
   })
 
   it.each([
