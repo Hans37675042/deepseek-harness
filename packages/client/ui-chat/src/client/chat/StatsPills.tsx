@@ -1,6 +1,6 @@
 // Composer statistics pills, each its own 'conversation.composer.dock' list
 // entry (activity, usage) so a plugin can replace or add one pill by id.
-// Compact keeps speed and cache hit as plain readings; Detailed adds counts,
+// Compact keeps speed (the latest answer's) and cache hit as plain readings; Detailed adds counts,
 // token totals, and click-open dialogs. Settled-node identity prevents
 // stream-delta updates from rerendering the pills.
 
@@ -101,6 +101,49 @@ export function latestTtftMs(nodes: ChatSnapshot['legacy']['nodes']): number | n
 }
 
 /**
+ * A settled step's first token → completion time in ms. Live-settled steps lose `timing.firstTokenTime` with their
+ * transient chunks, so the display latency stands in: completion minus (step start + latency).
+ * @param node - a settled assistant step.
+ * The final request attempt's first token wins when recorded, so a retry after the first token does not stretch
+ * decode time over the failed attempt and the retry wait.
+ * @returns decode wall time, or null when no first-token boundary is recorded.
+ */
+function stepDecodeMs(node: AssistantMessageNodeWithLatency): number | null {
+  if (node.attemptFirstTokenTime !== undefined && node.timing !== undefined) {
+    return Math.max(0, node.timing.completedTime - node.attemptFirstTokenTime)
+  }
+  const decodeMs = assistantStepReading(node).decodeMs
+  if (decodeMs !== null) return decodeMs
+  const { timing, firstTokenLatencyMs } = node
+  if (timing === undefined || timing.stepStartTime === null || firstTokenLatencyMs === undefined) return null
+  return Math.max(0, timing.completedTime - (timing.stepStartTime + firstTokenLatencyMs))
+}
+
+/**
+ * Output speed of the latest answer: the newest turn with a settled step that has both positive decode time and
+ * positive output tokens, summed over that turn's such steps (token-weighted). Queueing, load, prefill and tool time stay out
+ * because decode time starts at the first token. A running turn counts only its settled steps.
+ * @param nodes - snapshot nodes in timeline order.
+ * @returns tokens per second, or null when no turn qualifies.
+ */
+export function latestAnswerTokensPerSecond(nodes: ChatSnapshot['legacy']['nodes']): number | null {
+  let turn: number | null = null
+  let tokens = 0
+  let decodeMs = 0
+  for (let index = nodes.length - 1; index >= 0; index--) {
+    const node = nodes[index]
+    if (node?.kind !== 'assistant' || (turn !== null && node.turn !== turn)) continue
+    const stepMs = stepDecodeMs(node)
+    const outputTokens = assistantStepReading(node).outputTokens
+    if (stepMs === null || stepMs <= 0 || outputTokens === null || outputTokens <= 0) continue
+    turn = node.turn
+    tokens += outputTokens
+    decodeMs += stepMs
+  }
+  return turn === null ? null : tokens / (decodeMs / 1_000)
+}
+
+/**
  * Compact duration: 45.2s under a minute, 2m42s from there on.
  * @param ms - duration in milliseconds.
  * @returns display string.
@@ -196,10 +239,8 @@ function useSessionStats(useChat: StatPillProps['useChat'], useProjection: UsePr
   return useMemo(() => projected ?? deriveStats(settledNodes), [projected, settledNodes])
 }
 
-function decodeSpeed(stats: WindowStats, t: Translate): string {
-  return t('message.tokensPerSecond', {
-    tps: formatTokensPerSecond(stats.decodeTokens / (stats.decodeMs / 1_000)),
-  })
+function speedText(tokensPerSecond: number, t: Translate): string {
+  return t('message.tokensPerSecond', { tps: formatTokensPerSecond(tokensPerSecond) })
 }
 
 /** The full reading above a pill, only while an ellipsis cuts its label; the delay matches the dock's context meter. */
@@ -272,7 +313,7 @@ function DialogPill({ stat, icon, label, text, title, titleValue, children }: Pi
 }
 
 /**
- * Turn and step counts with whole-session speed, opening the time and speed
+ * Turn and step counts with the latest answer's speed, opening the time and speed
  * dialog; Compact keeps only the speed reading.
  */
 export const ActivityPill = memo(function ActivityPill({ useChat, useProjection, usePerformanceUsage, t }: StatPillProps) {
@@ -281,7 +322,10 @@ export const ActivityPill = memo(function ActivityPill({ useChat, useProjection,
   // "Latest" is always inside the loaded window, so the window nodes answer it without a projection.
   const windowNodes = useChat(s => s.legacy.nodes)
   const latestTtft = useMemo(() => latestTtftMs(windowNodes), [windowNodes])
-  const speed = stats.decodeMs > 0 ? decodeSpeed(stats, t) : null
+  const answerTps = useMemo(() => latestAnswerTokensPerSecond(windowNodes), [windowNodes])
+  // The pill shows the latest answer's speed; the session average stays a dialog row.
+  const speed = answerTps === null ? null : speedText(answerTps, t)
+  const averageSpeed = stats.decodeMs > 0 ? speedText(stats.decodeTokens / (stats.decodeMs / 1_000), t) : null
   const latest = latestTtft === null ? null : t('stats.latestTtft', { duration: formatDuration(latestTtft, t) })
   const icon = <IconGaugeOutlineRegular />
   if (mode === 'compact') {
@@ -293,7 +337,8 @@ export const ActivityPill = memo(function ActivityPill({ useChat, useProjection,
   const content: PillContent = { stat: 'activity', icon, ...reading([counts, speed, latest], latest) }
   // A window without one timed figure has no dialog rows to show, so the pill
   // stays a plain reading instead of a button opening an empty dialog.
-  const untimed = stats.llmMs <= 0 && stats.toolMs <= 0 && stats.ttftSteps <= 0 && speed === null && latestTtft === null
+  const untimed = stats.llmMs <= 0 && stats.toolMs <= 0 && stats.ttftSteps <= 0
+    && averageSpeed === null && speed === null && latestTtft === null
   if (untimed) return <PlainPill {...content} />
   return (
     // The counts head the dialog, so a cut-off reading stays complete once the dialog opens.
@@ -323,9 +368,15 @@ export const ActivityPill = memo(function ActivityPill({ useChat, useProjection,
             <dd>{formatDuration(latestTtft, t)}</dd>
           </>
         )}
-        {speed !== null && (
+        {averageSpeed !== null && (
           <>
             <dt>{t('stats.dialog.speed')}</dt>
+            <dd>{averageSpeed}</dd>
+          </>
+        )}
+        {speed !== null && (
+          <>
+            <dt>{t('stats.dialog.latestSpeed')}</dt>
             <dd>{speed}</dd>
           </>
         )}

@@ -9,7 +9,10 @@ import { bindSnapshotSelector, makeTranslate } from '@deepseek-ai/dsh-client-tes
 import { en as commonEn } from '@deepseek-ai/dsh-client-locale/src/locales/en.ts'
 import { zh as commonZh } from '@deepseek-ai/dsh-client-locale/src/locales/zh.ts'
 import { PartialArguments } from '@deepseek-ai/dsh-util-values'
-import { ActivityPill, UsagePill, deriveStats, formatDuration, latestTtftMs, type StatPillProps } from '../src/client/chat/StatsPills.tsx'
+import {
+  ActivityPill, UsagePill, deriveStats, formatDuration, latestAnswerTokensPerSecond, latestTtftMs, type StatPillProps,
+} from '../src/client/chat/StatsPills.tsx'
+import type { AssistantMessageNodeWithLatency } from '../src/client/contract/chat-nodes.ts'
 import { formatTokens } from '../src/client/chat/token-format.ts'
 import { en, zh } from '../src/client/locale.ts'
 import { chatSnapshotFixture } from './chat-snapshot-fixture.client.ts'
@@ -275,7 +278,8 @@ describe('composer stats pills', () => {
     // No tool call in this session: the row is absent, not zeroed.
     expect(details.textContent).not.toContain('Tool time')
     expect(details.textContent).toContain('Avg time to first token (TTFT)0.8s')
-    expect(details.textContent).toContain('Tokens per second (TPS)20 tok/s')
+    expect(details.textContent).toContain('Avg tokens per second (TPS)20 tok/s')
+    expect(details.textContent).toContain('Latest answer tokens per second (TPS)20 tok/s')
     // Token accounting lives on the usage pill's own dialog, not here.
     expect(dialog.textContent).not.toContain('Token usage')
   })
@@ -367,7 +371,8 @@ describe('composer stats pills', () => {
     expect(timeDialog.getAttribute('aria-label')).toBe('会话统计')
     expect(timeDialog.textContent).toContain('模型用时3.8秒')
     expect(timeDialog.textContent).toContain('首 token 平均（TTFT）0.8秒')
-    expect(timeDialog.textContent).toContain('输出速度（TPS）20 tok/s')
+    expect(timeDialog.textContent).toContain('平均输出速度（TPS）20 tok/s')
+    expect(timeDialog.textContent).toContain('本次回答输出速度（TPS）20 tok/s')
     fireEvent.keyDown(document, { key: 'Escape' })
     fireEvent.click(usagePill)
     const usageDialog = view.getByRole('dialog')
@@ -500,13 +505,14 @@ describe('composer stats pills', () => {
       }),
     })} />)
     const timePill = view.getAllByRole('button')[0]!
-    expect(timePill.textContent).toBe('200 turns 200 steps·20 tok/s')
+    // The pill speed is the latest answer's; the untimed window has none, so only the session average remains.
+    expect(timePill.textContent).toBe('200 turns 200 steps')
     fireEvent.click(timePill)
     const dialog = view.getByRole('dialog')
     expect(dialog.textContent).toContain('LLM time1m40s')
     expect(dialog.textContent).toContain('Tool time1m2s')
     expect(dialog.textContent).toContain('Avg time to first token (TTFT)0.8s')
-    expect(dialog.textContent).toContain('Tokens per second (TPS)20 tok/s')
+    expect(dialog.textContent).toContain('Avg tokens per second (TPS)20 tok/s')
   })
 
   it('omits the cache-hit segment when nothing was billed on the input side', () => {
@@ -616,7 +622,12 @@ describe('latest TTFT on the activity pill', () => {
   })
 
   it('keeps the accessible text of a pill without TTFT as it was', () => {
-    const { source } = makeSource({ nodes: [assistant(1, 1)] })
+    // Decode timing without a step start: the speed is known, the TTFT is not.
+    const untimedStart: AssistantMessageNode = {
+      ...assistant(1, 1, { outputTokens: 60 }),
+      timing: { stepStartTime: null, firstTokenTime: 1_000, completedTime: 4_000 },
+    }
+    const { source } = makeSource({ nodes: [untimedStart] })
     const view = render(<ActivityPill {...props(source)} useProjection={(key: string) => (key === 'sessionStats'
       ? { turns: 1, steps: 1, llmMs: 0, toolMs: 0, ttftMs: 0, ttftSteps: 0, decodeMs: 3_000, decodeTokens: 60 }
       : undefined)} />)
@@ -639,5 +650,163 @@ describe('latest TTFT on the activity pill', () => {
     const { source } = makeSource({ nodes: [assistant(1, 1)] })
     const view = render(<StatsPills {...props(source)} />)
     expect(view.container.textContent).not.toContain('TTFT')
+  })
+})
+
+describe('latest answer speed', () => {
+  /** A settled step whose timing yields exactly `decodeMs` of decode time. */
+  const step = (seq: number, turn: number, outputTokens: number, decodeMs: number): AssistantMessageNode => ({
+    ...assistant(seq, turn, { outputTokens }),
+    timing: { stepStartTime: seq * 10_000, firstTokenTime: seq * 10_000 + 500, completedTime: seq * 10_000 + 500 + decodeMs },
+  })
+  /** The live-settled shape: transient chunks are gone, so only the display latency survives. */
+  const liveSettled = (seq: number, turn: number, outputTokens: number, decodeMs: number): AssistantMessageNodeWithLatency => ({
+    ...assistant(seq, turn, { outputTokens }),
+    timing: { stepStartTime: seq * 10_000, firstTokenTime: null, completedTime: seq * 10_000 + 500 + decodeMs },
+    firstTokenLatencyMs: 500,
+  })
+
+  it('weights the newest turn by tokens and ignores earlier turns', () => {
+    const nodes = [step(1, 1, 38, 1_580), step(2, 2, 117, 2_810), step(3, 2, 160, 3_590)]
+    expect(latestAnswerTokensPerSecond(nodes)).toBeCloseTo(277 / 6.4, 6)
+  })
+
+  it('reads the decode time of live-settled steps from the display latency', () => {
+    expect(latestAnswerTokensPerSecond([liveSettled(1, 1, 100, 2_000)])).toBeCloseTo(50, 6)
+    expect(latestAnswerTokensPerSecond([step(1, 1, 38, 1_580), liveSettled(2, 2, 117, 2_810), step(3, 2, 160, 3_590)]))
+      .toBeCloseTo(277 / 6.4, 6)
+  })
+
+  it('counts only steps with both decode time and output tokens', () => {
+    const noTokens = step(3, 2, 0, 9_000)
+    const noUsage: AssistantMessageNode = {
+      ...assistant(4, 2), timing: { stepStartTime: 40_000, firstTokenTime: 40_500, completedTime: 49_500 },
+    }
+    const noTiming = assistant(5, 2, { outputTokens: 500 })
+    const counted = step(2, 2, 100, 2_000)
+    // Only `counted` has both: the zero-token step adds neither tokens nor its 9 s of decode time.
+    expect(latestAnswerTokensPerSecond([step(1, 1, 38, 1_580), counted, noUsage, noTiming, noTokens]))
+      .toBeCloseTo(50, 6)
+  })
+
+  it('falls back to an earlier turn when the newest turn produced no output tokens', () => {
+    expect(latestAnswerTokensPerSecond([step(1, 1, 38, 1_580), step(2, 2, 0, 3_000)])).toBeCloseTo(38 / 1.58, 6)
+    expect(latestAnswerTokensPerSecond([step(1, 1, 0, 1_000)])).toBeNull()
+  })
+
+  it('prefers the current attempt first token time over the step first token time', () => {
+    const retried: AssistantMessageNodeWithLatency = { ...step(1, 1, 100, 6_000), attemptFirstTokenTime: 10_000 + 500 + 4_000 }
+    // Decode runs from the retried attempt's first token (4 s into the failed step) to completion: 2 s.
+    expect(latestAnswerTokensPerSecond([retried])).toBeCloseTo(50, 6)
+    const liveSettledRetried: AssistantMessageNodeWithLatency = { ...liveSettled(1, 1, 100, 6_000), attemptFirstTokenTime: 14_500 }
+    expect(latestAnswerTokensPerSecond([liveSettledRetried])).toBeCloseTo(50, 6)
+  })
+
+  it('falls back to the newest turn that has timing and is null without one', () => {
+    expect(latestAnswerTokensPerSecond([step(1, 1, 38, 1_580), assistant(2, 2, { outputTokens: 50 })]))
+      .toBeCloseTo(38 / 1.58, 6)
+    expect(latestAnswerTokensPerSecond([assistant(1, 1, { outputTokens: 5 })])).toBeNull()
+    expect(latestAnswerTokensPerSecond([])).toBeNull()
+  })
+
+  it('falls back to an earlier turn when the newest turn has only a non-positive-decode step', () => {
+    expect(latestAnswerTokensPerSecond([step(1, 1, 38, 1_580), step(2, 2, 50, 0)])).toBeCloseTo(38 / 1.58, 6)
+  })
+
+  it('sums only the newest turn when tool results and other turns interleave', () => {
+    const tool: ToolResultNode = {
+      kind: 'tool-result', seq: 9, time: 9_000, callId: 'c', call: null, callTime: 4_000, content: [],
+      name: '', args: PartialArguments.EMPTY, isError: false, subCalls: [],
+    }
+    const nodes = [step(1, 1, 38, 1_580), step(2, 2, 100, 2_000), tool, step(3, 1, 20, 1_000), step(4, 2, 100, 2_000)]
+    // Walking from the end: turn 2 steps (seq 4, 2) count; the turn 1 step between them does not.
+    expect(latestAnswerTokensPerSecond(nodes)).toBeCloseTo(50, 6)
+    expect(latestAnswerTokensPerSecond([step(1, 1, 38, 1_580), tool])).toBeCloseTo(38 / 1.58, 6)
+  })
+
+  it('skips a live-settled step without a step start or whose latency exceeds its duration', () => {
+    const noStart: AssistantMessageNodeWithLatency = {
+      ...liveSettled(2, 2, 100, 2_000), timing: { stepStartTime: null, firstTokenTime: null, completedTime: 30_000 },
+    }
+    const negative: AssistantMessageNodeWithLatency = {
+      ...liveSettled(3, 3, 100, 2_000), firstTokenLatencyMs: 99_000,
+    }
+    expect(latestAnswerTokensPerSecond([step(1, 1, 38, 1_580), noStart])).toBeCloseTo(38 / 1.58, 6)
+    expect(latestAnswerTokensPerSecond([step(1, 1, 38, 1_580), negative])).toBeCloseTo(38 / 1.58, 6)
+    expect(latestAnswerTokensPerSecond([noStart])).toBeNull()
+  })
+
+  it('prefers the recorded first token time over the display latency', () => {
+    const both: AssistantMessageNodeWithLatency = { ...step(1, 1, 100, 2_000), firstTokenLatencyMs: 1_500 }
+    expect(latestAnswerTokensPerSecond([both])).toBeCloseTo(50, 6)
+  })
+
+  it('mixes live-settled and replayed steps of one turn token-weighted', () => {
+    expect(latestAnswerTokensPerSecond([liveSettled(1, 1, 100, 2_000), step(2, 1, 60, 1_000), liveSettled(3, 1, 40, 1_000)]))
+      .toBeCloseTo(200 / 4, 6)
+  })
+
+  it('reports a very short step without clamping the rate', () => {
+    expect(latestAnswerTokensPerSecond([step(1, 1, 10, 1)])).toBeCloseTo(10_000, 6)
+  })
+
+  describe('on the activity pill', () => {
+    const USAGE = { uncachedInputTokens: 10, outputTokens: 5, cacheReadTokens: 90, cacheWriteTokens: 0 }
+    const props = (source: ReturnType<typeof makeSource>['source'], mode: 'detailed' | 'compact' = 'detailed'): StatPillProps => ({
+      usePerformanceUsage: selector => selector(mode),
+      useChat: bindSnapshotSelector(source),
+      useProjection: (key: string) => (key === 'tokenUsage' ? USAGE : undefined),
+      t: tEn,
+    })
+    const slowThenFast = () => [step(1, 1, 38, 1_580), step(2, 2, 117, 2_810), step(3, 2, 160, 3_590)]
+
+    it('shows the latest answer speed, not the session average, and keeps the average in the dialog', () => {
+      const { source } = makeSource({ nodes: slowThenFast() })
+      const view = render(<StatsPills {...props(source)} />)
+      const pill = view.getAllByRole('button')[0]!
+      // Session average would be 315 / 7.98 = 39.5; the latest answer is 277 / 6.4 = 43.3.
+      expect(pill.textContent).toBe('2 turns 3 steps·43 tok/s ·TTFT 0.5s')
+      fireEvent.click(pill)
+      const details = view.getByRole('dialog').querySelector('[data-session-stats-details]') as HTMLElement
+      expect(details.textContent).toContain('Avg tokens per second (TPS)39 tok/s')
+      expect(details.textContent).toContain('Latest answer tokens per second (TPS)43 tok/s')
+    })
+
+    it('keeps the previous answer value while the new turn has settled nothing', () => {
+      const { source, set } = makeSource({ nodes: slowThenFast() })
+      const view = render(<StatsPills {...props(source)} />)
+      act(() => { set({ partial: { turn: 3, step: 1, blocks: [{ kind: 'text', text: 'streaming' }] } }) })
+      expect(view.getAllByRole('button')[0]!.textContent).toContain('43 tok/s')
+    })
+
+    it('shows the live-settled value, and the same value for a step with a recorded first token time', () => {
+      const live = makeSource({ nodes: [liveSettled(1, 1, 100, 2_000)] })
+      const view = render(<StatsPills {...props(live.source)} />)
+      expect(view.getAllByRole('button')[0]!.textContent).toContain('50 tok/s')
+      view.unmount()
+      const replayed = makeSource({ nodes: [step(1, 1, 100, 2_000)] })
+      const again = render(<StatsPills {...props(replayed.source)} />)
+      expect(again.getAllByRole('button')[0]!.textContent).toContain('50 tok/s')
+    })
+
+    it('omits the speed segment when no turn has timing', () => {
+      const { source } = makeSource({ nodes: [assistant(1, 1, { outputTokens: 5 })] })
+      const view = render(<StatsPills {...props(source)} />)
+      expect(view.container.textContent).toContain('1 turns 1 steps')
+      expect(view.container.textContent).not.toContain('tok/s')
+    })
+
+    it('uses the latest answer speed in compact mode', () => {
+      const { source } = makeSource({ nodes: slowThenFast() })
+      const view = render(<StatsPills {...props(source, 'compact')} />)
+      expect(view.container.textContent).toContain('43 tok/s ·TTFT 0.5s')
+    })
+
+    it('labels the answer row in the active locale', () => {
+      const { source } = makeSource({ nodes: slowThenFast() })
+      const view = render(<StatsPills {...props(source)} t={t} />)
+      fireEvent.click(view.getAllByRole('button')[0]!)
+      expect(view.getByRole('dialog').textContent).toContain('本次回答输出速度（TPS）43 tok/s')
+    })
   })
 })
