@@ -3477,6 +3477,9 @@ importers:
       '@deepseek-ai/schemastery':
         specifier: link:../../../vendor/schemastery
         version: link:../../../vendor/schemastery
+      opencc-js:
+        specifier: ^1.4.2
+        version: 1.4.2
     devDependencies:
       '@deepseek-ai/cordis':
         specifier: workspace:~
@@ -24409,6 +24412,9 @@ packages:
       zod:
         optional: true
 
+  opencc-js@1.4.2:
+    resolution: {integrity: sha512-EdcspgdROiCCZDM+jZR6Pa670xW+EW2QhctPBQ8gRjg6lrx4IHEl+2s+kt5izk/TkxVRgdWuFgaGkaEdIUfdaw==}
+
   opener@1.5.2:
     resolution: {integrity: sha512-ur5UIdyw5Y7yEj9wLzhqXiy6GZ3Mwx0yGI+5sMn2r0N0v3cKJvUmFH5yPP+WXh9e0xfyzyJX95D8l088DNFj7A==}
     hasBin: true
@@ -32330,6 +32336,8 @@ snapshots:
       undici: 8.11.2
       ws: 8.21.3
       zod: 4.4.3
+
+  opencc-js@1.4.2: {}
 
   opener@1.5.2: {}
 

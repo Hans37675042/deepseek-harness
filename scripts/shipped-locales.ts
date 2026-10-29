@@ -1,6 +1,13 @@
 /** Languages whose UI dictionaries and package metadata ship with Harness. */
 export const SHIPPED_LOCALE_IDS = ['en', 'zh', 'ja', 'es', 'fr', 'de', 'ru', 'pt'] as const
 
+/**
+ * Languages the web UI offers: the shipped set plus locales derived at runtime.
+ * `zh-TW` converts the `zh` dictionaries on the fly, so it has no dictionaries
+ * or package metadata of its own and stays out of {@link SHIPPED_LOCALE_IDS}.
+ */
+export const WEB_LOCALE_IDS = [...SHIPPED_LOCALE_IDS, 'zh-TW'] as const
+
 /** Locale id required by repository translation checks. */
 export type ShippedLocaleId = typeof SHIPPED_LOCALE_IDS[number]
 
