@@ -42,6 +42,11 @@ export interface AssistantChatData {
   readonly blocks: readonly AssistantBlock[]
   readonly time: number
   readonly usage?: unknown
+  /**
+   * Session-clock time the current request attempt began (`step/start`, or the latest `llm/retry`) while it has
+   * produced no token delta; absent once a text, reasoning, or tool-call delta arrives or the step settles.
+   */
+  readonly waitingSince?: number
   readonly finalNode?: AssistantMessageNode
 }
 

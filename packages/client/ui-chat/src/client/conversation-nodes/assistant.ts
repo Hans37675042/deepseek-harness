@@ -34,11 +34,13 @@ interface AssistantState {
   readonly firstVisibleSeq: number | undefined
   readonly firstVisibleTime: number | undefined
   readonly firstTokenTime: number | undefined
+  /** Start of the current request attempt while it has produced no token delta; cleared by the first one. */
+  readonly waitSince: number | undefined
   readonly final: ConversationMatch | undefined
   readonly usage: unknown
 }
 
-function initialState(turn: number, step: number): AssistantState {
+function initialState(turn: number, step: number, waitSince?: number): AssistantState {
   return {
     turn,
     step,
@@ -47,6 +49,7 @@ function initialState(turn: number, step: number): AssistantState {
     firstVisibleSeq: undefined,
     firstVisibleTime: undefined,
     firstTokenTime: undefined,
+    waitSince,
     final: undefined,
     usage: undefined,
   }
@@ -79,9 +82,10 @@ function hasInterruptionEvidence(blocks: readonly AssistantBlock[]): boolean {
   })
 }
 
-function resetForRetry(state: AssistantState): AssistantState {
+/** The retry restarts only the live wait; `firstTokenTime` keeps the first attempt's value so settled timing is unchanged. */
+function resetForRetry(state: AssistantState, time: number): AssistantState {
   return {
-    ...initialState(state.turn, state.step),
+    ...initialState(state.turn, state.step, time),
     firstTokenTime: state.firstTokenTime,
   }
 }
@@ -158,6 +162,7 @@ function updateChunk(
     ...firstToken && state.firstTokenTime === undefined
       ? { firstTokenTime: time }
       : {},
+    ...firstToken ? { waitSince: undefined } : {},
   }
 }
 
@@ -185,6 +190,11 @@ function closedBoundary(location: ConversationLocation): { seq: number; time: nu
     return location.turn.end
   }
   return undefined
+}
+
+function boundaryClosed(context: ConversationNodeContext<AssistantState>): boolean {
+  const location = context.start?.location ?? context.matches.at(-1)?.location
+  return location !== undefined && closedBoundary(location) !== undefined
 }
 
 function finalNode(
@@ -241,7 +251,7 @@ function fallbackState(context: ConversationNodeContext<AssistantState>): Assist
       continue
     }
     if (match.event.type === 'llm/retry' && state !== undefined) {
-      state = resetForRetry(state)
+      state = resetForRetry(state, match.event.time)
     }
   }
   return state
@@ -277,6 +287,9 @@ function projectAssistant(context: ConversationNodeContext<AssistantState>): Ass
       blocks,
       time,
       ...state.usage === undefined ? {} : { usage: state.usage },
+      ...settled === undefined && state.waitSince !== undefined && !boundaryClosed(context)
+        ? { waitingSince: state.waitSince }
+        : {},
       ...settled === undefined ? {} : { finalNode: settled },
     },
   }
@@ -306,7 +319,7 @@ export const assistantDefinition: ConversationNodeDefinition<AssistantState> = {
   },
   start: (_context, match) => {
     if (match.event.type !== 'step/start') throw new Error('assistant-step start requires step/start')
-    return initialState(match.event.data.turn, match.event.data.step)
+    return initialState(match.event.data.turn, match.event.data.step, match.event.time)
   },
   update: (context, match) => {
     if (match.event.type === 'assistant/live-chunk') {
@@ -314,12 +327,12 @@ export const assistantDefinition: ConversationNodeDefinition<AssistantState> = {
     }
     if (match.event.type === 'assistant/message') return settleMessage(context.state, match, match.event)
     if (match.event.type === 'llm/retry') {
-      return resetForRetry(context.state)
+      return resetForRetry(context.state, match.event.time)
     }
     return context.state
   },
   publication: (match) => {
-    if (match.event.type === 'step/start') return 'none'
+    if (match.event.type === 'step/start') return 'immediate'
     if (match.event.type !== 'assistant/live-chunk') return 'immediate'
     const type = match.event.data.chunk.type
     return type === 'usage' || type === 'finish' ? 'none' : 'animation-frame'
@@ -345,7 +358,7 @@ export const assistantDefinition: ConversationNodeDefinition<AssistantState> = {
     }
     const settled = data.finalNode
     const visible = settled === undefined ? state.visibleBlocks > 0 : hasVisibleContent(data.blocks)
-    if (settled === undefined && !visible && current == null) return null
+    if (settled === undefined && !visible && current == null && data.waitingSince === undefined) return null
     // A successful message retains its live anchor alongside pending Tool calls.
     const anchorSeq = (settled?.interrupted === true ? settled.seq : state.firstVisibleSeq ?? settled?.seq)
       ?? context.matches[0]?.event.seq ?? 0

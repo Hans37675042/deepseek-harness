@@ -9,6 +9,8 @@ import css from './ChatView.module.css'
 
 interface RunningStatusProps {
   readonly startTime: number | undefined
+  /** Start of the current model request attempt while it has produced no token; replaces the running label. */
+  readonly waitingSince?: number | undefined
   /** Freeze the shown duration while the Client cannot observe the Session. */
   readonly paused: boolean
   /** Keep the slot without showing or announcing the status: the Session stopped before its Turn closed. */
@@ -18,21 +20,22 @@ interface RunningStatusProps {
 
 /**
  * Show live elapsed time after the current Turn's content without announcing ticks.
- * @param props - Current Turn start time, pause state, and localized copy.
+ * @param props - Current Turn start time, first-token wait start, pause state, and localized copy.
  * @returns the blue running indicator; mount while the Session is running, or holding its slot hidden until the
  * Turn's actions row replaces it.
  */
-export const RunningStatus = memo(function RunningStatus({ startTime, paused, holding = false, t }: RunningStatusProps) {
+export const RunningStatus = memo(function RunningStatus({ startTime, waitingSince, paused, holding = false, t }: RunningStatusProps) {
   const [now, setNow] = useState(Date.now)
   useEffect(() => {
-    if (startTime === undefined || paused || holding) return
+    if ((startTime === undefined && waitingSince === undefined) || paused || holding) return
     setNow(Date.now())
     const timer = setInterval(() => { setNow(Date.now()) }, LIVE_RUN_CLOCK_INTERVAL_MS)
     return () => { clearInterval(timer) }
-  }, [startTime, paused, holding])
-  const label = startTime === undefined ? t('chat.deepDiving') : t('chat.deepDivingFor', {
-    duration: formatRunDuration(Math.max(1000, now - startTime), t).map(part => part.text).join(''),
-  })
+  }, [startTime, waitingSince, paused, holding])
+  const duration = (since: number) => formatRunDuration(Math.max(1000, now - since), t).map(part => part.text).join('')
+  const label = waitingSince !== undefined
+    ? t('chat.waitingFirstToken', { duration: duration(waitingSince) })
+    : startTime === undefined ? t('chat.deepDiving') : t('chat.deepDivingFor', { duration: duration(startTime) })
   return (
     <div className={css.running} data-chat-running data-holding={holding ? '' : undefined} aria-hidden={holding || undefined}>
       {holding ? null : (
