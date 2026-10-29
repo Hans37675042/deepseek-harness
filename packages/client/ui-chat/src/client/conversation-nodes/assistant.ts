@@ -39,6 +39,8 @@ interface AssistantState {
   readonly waitSince: number | undefined
   /** First token time read from a durable stream; display-only, so live-chunk `firstTokenTime` stays authoritative. */
   readonly streamFirstTokenTime: number | undefined
+  /** First token time of the current request attempt; display-only, reset by `llm/retry`, unlike `firstTokenTime`. */
+  readonly attemptFirstTokenTime: number | undefined
   readonly final: ConversationMatch | undefined
   readonly usage: unknown
 }
@@ -54,6 +56,7 @@ function initialState(turn: number, step: number, waitSince?: number): Assistant
     firstTokenTime: undefined,
     waitSince,
     streamFirstTokenTime: undefined,
+    attemptFirstTokenTime: undefined,
     final: undefined,
     usage: undefined,
   }
@@ -86,7 +89,10 @@ function hasInterruptionEvidence(blocks: readonly AssistantBlock[]): boolean {
   })
 }
 
-/** The retry restarts only the live wait; `firstTokenTime` keeps the first attempt's value so settled timing is unchanged. */
+/**
+ * The retry restarts the live wait and the per-attempt display state (`attemptFirstTokenTime`, `streamFirstTokenTime`);
+ * `firstTokenTime` keeps the first attempt's value so settled timing is unchanged.
+ */
 function resetForRetry(state: AssistantState, time: number): AssistantState {
   return {
     ...initialState(state.turn, state.step, time),
@@ -106,7 +112,8 @@ function updateChunk(
       && (chunk.name === undefined || chunk.name === previous.name)
       && (state.firstTokenTime !== undefined || !isTokenDelta(chunk))) {
       // A retried attempt inherits the first attempt's `firstTokenTime`, so this attempt's first token ends the wait here.
-      return state.waitSince !== undefined && isTokenDelta(chunk) ? { ...state, waitSince: undefined } : state
+      if (!isTokenDelta(chunk) || (state.waitSince === undefined && state.attemptFirstTokenTime !== undefined)) return state
+      return { ...state, waitSince: undefined, attemptFirstTokenTime: state.attemptFirstTokenTime ?? time }
     }
   }
   const blocks = [...state.blocks]
@@ -168,6 +175,9 @@ function updateChunk(
       : {},
     ...firstToken && state.firstTokenTime === undefined
       ? { firstTokenTime: time }
+      : {},
+    ...firstToken && state.attemptFirstTokenTime === undefined
+      ? { attemptFirstTokenTime: time }
       : {},
     ...firstToken ? { waitSince: undefined } : {},
   }
@@ -234,6 +244,7 @@ function finalNode(
   if (final?.event.type === 'assistant/message') {
     const event = final.event
     const latencyMs = firstTokenLatency(state, context)
+    const attemptFirstTokenTime = state.attemptFirstTokenTime ?? state.streamFirstTokenTime
     return {
       kind: 'assistant',
       seq: event.seq,
@@ -249,6 +260,7 @@ function finalNode(
         completedTime: event.time,
       },
       ...latencyMs === undefined ? {} : { firstTokenLatencyMs: latencyMs },
+      ...attemptFirstTokenTime === undefined ? {} : { attemptFirstTokenTime },
       ...event.data.interrupted === true ? { interrupted: true } : {},
     }
   }

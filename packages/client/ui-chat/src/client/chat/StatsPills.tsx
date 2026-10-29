@@ -104,9 +104,14 @@ export function latestTtftMs(nodes: ChatSnapshot['legacy']['nodes']): number | n
  * A settled step's first token → completion time in ms. Live-settled steps lose `timing.firstTokenTime` with their
  * transient chunks, so the display latency stands in: completion minus (step start + latency).
  * @param node - a settled assistant step.
+ * The final request attempt's first token wins when recorded, so a retry after the first token does not stretch
+ * decode time over the failed attempt and the retry wait.
  * @returns decode wall time, or null when no first-token boundary is recorded.
  */
 function stepDecodeMs(node: AssistantMessageNodeWithLatency): number | null {
+  if (node.attemptFirstTokenTime !== undefined && node.timing !== undefined) {
+    return Math.max(0, node.timing.completedTime - node.attemptFirstTokenTime)
+  }
   const decodeMs = assistantStepReading(node).decodeMs
   if (decodeMs !== null) return decodeMs
   const { timing, firstTokenLatencyMs } = node
@@ -115,8 +120,8 @@ function stepDecodeMs(node: AssistantMessageNodeWithLatency): number | null {
 }
 
 /**
- * Output speed of the latest answer: the newest turn with a settled step that has both decode time and output
- * tokens, summed over that turn's such steps (token-weighted). Queueing, load, prefill and tool time stay out
+ * Output speed of the latest answer: the newest turn with a settled step that has both positive decode time and
+ * positive output tokens, summed over that turn's such steps (token-weighted). Queueing, load, prefill and tool time stay out
  * because decode time starts at the first token. A running turn counts only its settled steps.
  * @param nodes - snapshot nodes in timeline order.
  * @returns tokens per second, or null when no turn qualifies.
@@ -130,7 +135,7 @@ export function latestAnswerTokensPerSecond(nodes: ChatSnapshot['legacy']['nodes
     if (node?.kind !== 'assistant' || (turn !== null && node.turn !== turn)) continue
     const stepMs = stepDecodeMs(node)
     const outputTokens = assistantStepReading(node).outputTokens
-    if (stepMs === null || stepMs <= 0 || outputTokens === null) continue
+    if (stepMs === null || stepMs <= 0 || outputTokens === null || outputTokens <= 0) continue
     turn = node.turn
     tokens += outputTokens
     decodeMs += stepMs
@@ -308,7 +313,7 @@ function DialogPill({ stat, icon, label, text, title, titleValue, children }: Pi
 }
 
 /**
- * Turn and step counts with whole-session speed, opening the time and speed
+ * Turn and step counts with the latest answer's speed, opening the time and speed
  * dialog; Compact keeps only the speed reading.
  */
 export const ActivityPill = memo(function ActivityPill({ useChat, useProjection, usePerformanceUsage, t }: StatPillProps) {

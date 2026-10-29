@@ -53,8 +53,13 @@ export interface AssistantChatData {
 /**
  * Assistant message node plus a display-only step start → first token latency (ms) derived from the durable stream,
  * so it survives transient chunk retirement. Absent when either end is unrecorded; `timing` stays authoritative.
+ * `attemptFirstTokenTime` is the session-clock first-token time of the final request attempt (reset at each
+ * `llm/retry`), so decode speed excludes failed attempts and retry waits; `timing` keeps the first attempt's value.
  */
-export type AssistantMessageNodeWithLatency = AssistantMessageNode & { readonly firstTokenLatencyMs?: number }
+export type AssistantMessageNodeWithLatency = AssistantMessageNode & {
+  readonly firstTokenLatencyMs?: number
+  readonly attemptFirstTokenTime?: number
+}
 
 /** Settled or interrupted Assistant payload with its durable presentation node. */
 export type FinalAssistantChatData = AssistantChatData & {
