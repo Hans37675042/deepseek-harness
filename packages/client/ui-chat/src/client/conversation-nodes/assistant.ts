@@ -4,9 +4,10 @@ import type {
   ConversationNodeContext, ConversationNodeDefinition,
 } from '@deepseek-ai/dsh-client-ui-conversation/client'
 import type { StreamChunk } from '@deepseek-ai/dsh-llm'
+import { assistantStreamFirstTokenTime } from '@deepseek-ai/dsh-llm/assistant-stream'
 import type {} from '@deepseek-ai/dsh-llm-retry/types'
 import type { SessionEvent } from '@deepseek-ai/dsh-session/types'
-import type { AssistantChatData } from '../contract/chat-nodes.ts'
+import type { AssistantChatData, AssistantMessageNodeWithLatency } from '../contract/chat-nodes.ts'
 import { CHAT_SYNTHETIC_SEQ_OFFSETS, chatNode } from './common.ts'
 import {
   emptyAssistantBlock, isTokenDelta, toAssistantBlock, toAssistantBlocks,
@@ -36,6 +37,8 @@ interface AssistantState {
   readonly firstTokenTime: number | undefined
   /** Start of the current request attempt while it has produced no token delta; cleared by the first one. */
   readonly waitSince: number | undefined
+  /** First token time read from a durable stream; display-only, so live-chunk `firstTokenTime` stays authoritative. */
+  readonly streamFirstTokenTime: number | undefined
   readonly final: ConversationMatch | undefined
   readonly usage: unknown
 }
@@ -50,6 +53,7 @@ function initialState(turn: number, step: number, waitSince?: number): Assistant
     firstVisibleTime: undefined,
     firstTokenTime: undefined,
     waitSince,
+    streamFirstTokenTime: undefined,
     final: undefined,
     usage: undefined,
   }
@@ -100,7 +104,10 @@ function updateChunk(
     const previous = state.blocks[chunk.index]
     if (previous?.kind === 'tool-call' && previous.callId !== ''
       && (chunk.name === undefined || chunk.name === previous.name)
-      && (state.firstTokenTime !== undefined || !isTokenDelta(chunk))) return state
+      && (state.firstTokenTime !== undefined || !isTokenDelta(chunk))) {
+      // A retried attempt inherits the first attempt's `firstTokenTime`, so this attempt's first token ends the wait here.
+      return state.waitSince !== undefined && isTokenDelta(chunk) ? { ...state, waitSince: undefined } : state
+    }
   }
   const blocks = [...state.blocks]
   let changedIndex = -1
@@ -166,6 +173,19 @@ function updateChunk(
   }
 }
 
+/** Read the durable stream's first token; a stream that carries one ends the live wait. */
+function settleStream(
+  state: AssistantState,
+  event: SessionEvent<'assistant/message' | 'assistant/attempt'>,
+): AssistantState {
+  const streamFirstTokenTime = state.streamFirstTokenTime ?? assistantStreamFirstTokenTime(event.data.stream)
+  return {
+    ...state,
+    streamFirstTokenTime,
+    ...streamFirstTokenTime === undefined ? {} : { waitSince: undefined },
+  }
+}
+
 function settleMessage(
   state: AssistantState,
   match: ConversationMatch,
@@ -173,7 +193,7 @@ function settleMessage(
 ): AssistantState {
   const blocks = toAssistantBlocks(event.data.message.content)
   return {
-    ...state,
+    ...settleStream(state, event),
     blocks,
     visibleBlocks: countVisibleBlocks(blocks),
     final: match,
@@ -197,13 +217,23 @@ function boundaryClosed(context: ConversationNodeContext<AssistantState>): boole
   return location !== undefined && closedBoundary(location) !== undefined
 }
 
+function firstTokenLatency(
+  state: AssistantState,
+  context: ConversationNodeContext<AssistantState>,
+): number | undefined {
+  const first = state.firstTokenTime ?? state.streamFirstTokenTime
+  const start = context.start?.event.time
+  return first === undefined || start === undefined ? undefined : Math.max(0, first - start)
+}
+
 function finalNode(
   state: AssistantState,
   context: ConversationNodeContext<AssistantState>,
-): AssistantMessageNode | undefined {
+): AssistantMessageNodeWithLatency | undefined {
   const final = state.final
   if (final?.event.type === 'assistant/message') {
     const event = final.event
+    const latencyMs = firstTokenLatency(state, context)
     return {
       kind: 'assistant',
       seq: event.seq,
@@ -218,6 +248,7 @@ function finalNode(
         firstTokenTime: state.firstTokenTime ?? null,
         completedTime: event.time,
       },
+      ...latencyMs === undefined ? {} : { firstTokenLatencyMs: latencyMs },
       ...event.data.interrupted === true ? { interrupted: true } : {},
     }
   }
@@ -248,6 +279,10 @@ function fallbackState(context: ConversationNodeContext<AssistantState>): Assist
     if (match.event.type === 'assistant/message') {
       state ??= initialState(match.event.data.turn, match.event.data.step)
       state = settleMessage(state, match, match.event)
+      continue
+    }
+    if (match.event.type === 'assistant/attempt' && state !== undefined) {
+      state = settleStream(state, match.event)
       continue
     }
     if (match.event.type === 'llm/retry' && state !== undefined) {
@@ -309,6 +344,7 @@ export const assistantDefinition: ConversationNodeDefinition<AssistantState> = {
   match: (event) => {
     if (event.type === 'step/start') return { id: `${event.data.turn}:${event.data.step}`, role: 'start' }
     if (event.type === 'assistant/live-chunk'
+      || event.type === 'assistant/attempt'
       || (event.type === 'assistant/message' && event.surfaceOp === 'append')) {
       return { id: `${event.data.turn}:${event.data.step}`, role: 'update' }
     }
@@ -326,6 +362,7 @@ export const assistantDefinition: ConversationNodeDefinition<AssistantState> = {
       return updateChunk(context.state, match.event.data.chunk, match.event.seq, match.event.time)
     }
     if (match.event.type === 'assistant/message') return settleMessage(context.state, match, match.event)
+    if (match.event.type === 'assistant/attempt') return settleStream(context.state, match.event)
     if (match.event.type === 'llm/retry') {
       return resetForRetry(context.state, match.event.time)
     }
@@ -380,6 +417,7 @@ export function registerAssistantConversationNode(ctx: Context): void {
       'step/start': match,
       'assistant/live-chunk': match,
       'assistant/message': match,
+      'assistant/attempt': match,
       'llm/retry': match,
     },
   })

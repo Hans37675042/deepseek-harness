@@ -50,6 +50,12 @@ export interface AssistantChatData {
   readonly finalNode?: AssistantMessageNode
 }
 
+/**
+ * Assistant message node plus a display-only step start → first token latency (ms) derived from the durable stream,
+ * so it survives transient chunk retirement. Absent when either end is unrecorded; `timing` stays authoritative.
+ */
+export type AssistantMessageNodeWithLatency = AssistantMessageNode & { readonly firstTokenLatencyMs?: number }
+
 /** Settled or interrupted Assistant payload with its durable presentation node. */
 export type FinalAssistantChatData = AssistantChatData & {
   readonly finalNode: AssistantMessageNode

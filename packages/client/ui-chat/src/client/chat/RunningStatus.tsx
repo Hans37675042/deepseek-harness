@@ -1,5 +1,5 @@
 /** Running Turn clock isolated from the transcript's render cycle. */
-import { memo, useEffect, useState } from 'react'
+import { memo, useEffect, useMemo, useState } from 'react'
 import { TextShimmer } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { ChatViewSlotProps } from '../contract/slots.ts'
 import { formatRunDuration, LIVE_RUN_CLOCK_INTERVAL_MS } from './message-chrome.ts'
@@ -26,6 +26,9 @@ interface RunningStatusProps {
  */
 export const RunningStatus = memo(function RunningStatus({ startTime, waitingSince, paused, holding = false, t }: RunningStatusProps) {
   const [now, setNow] = useState(Date.now)
+  // `waitingSince` is a Host event time. Anchoring the live wait to the local clock when it changes keeps Host/Client
+  // clock skew out of the figure; a page opened mid-wait counts from its mount, unlike the Turn clock below.
+  const waitStart = useMemo(() => (waitingSince === undefined ? undefined : Date.now()), [waitingSince])
   useEffect(() => {
     if ((startTime === undefined && waitingSince === undefined) || paused || holding) return
     setNow(Date.now())
@@ -33,8 +36,8 @@ export const RunningStatus = memo(function RunningStatus({ startTime, waitingSin
     return () => { clearInterval(timer) }
   }, [startTime, waitingSince, paused, holding])
   const duration = (since: number) => formatRunDuration(Math.max(1000, now - since), t).map(part => part.text).join('')
-  const label = waitingSince !== undefined
-    ? t('chat.waitingFirstToken', { duration: duration(waitingSince) })
+  const label = waitStart !== undefined
+    ? t('chat.waitingFirstToken', { duration: duration(waitStart) })
     : startTime === undefined ? t('chat.deepDiving') : t('chat.deepDivingFor', { duration: duration(startTime) })
   return (
     <div className={css.running} data-chat-running data-holding={holding ? '' : undefined} aria-hidden={holding || undefined}>
